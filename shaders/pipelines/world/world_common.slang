@@ -263,6 +263,43 @@ public struct Section {
     public uint triBase[4]; // fixed bucket order: solid/cutout/translucent/water
 };
 
+public TerrainPrim terrainPrim(Section section, uint triangle) {
+    if ((section.uvAddr & uint64_t(1)) == uint64_t(0))
+        return ConstPtr<TerrainPrim>(section.primAddr)[triangle];
+    ConstPtr<uint> words = ConstPtr<uint>(section.primAddr);
+    uint base = (triangle >> 1) * 3u;
+    uint3 data = uint3(words[base], words[base+1u], words[base+2u]);
+    uint face = (data.y >> 24) & 7u;
+    uint axis = (face >> 1) == 0u ? 1u : (face >> 1) == 1u ? 2u : 0u;
+    TerrainPrim result;
+    result.normal = float4(0.0, 0.0, 0.0, float(data.x >> 28) / 15.0);
+    result.normal[axis] = (face & 1u) == 0u ? -1.0 : 1.0;
+    result.tint = float4(float3((data.y >> 16) & 255u, (data.y >> 8) & 255u, data.y & 255u) / 255.0,
+                        float((data.x >> 16) & 511u));
+    result.materialId = data.x & 65535u;
+    result.flags = 2u;
+    result.aux0 = data.z & 65535u;
+    result.aux1 = face | (((data.y >> 27) & 3u) << 3) | (((data.x >> 25) & 7u) << 5);
+    return result;
+}
+
+public float2 terrainLodUv(TerrainPrim primitive, float3 position) {
+    uint axis = (primitive.aux1 & 7u) >> 1;
+    uint u = axis == 2u ? 1u : 0u;
+    uint v = axis == 1u ? 1u : 2u;
+    return float2(position[u], position[v]) / float(1u << ((primitive.aux1 >> 5) & 7u));
+}
+
+public void terrainUvs(Section section, TerrainPrim primitive, uint triangle, float3 p0, float3 p1, float3 p2,
+                       out float2 a, out float2 b, out float2 c) {
+    if ((section.uvAddr & uint64_t(1)) != uint64_t(0)) {
+        a = terrainLodUv(primitive, p0); b = terrainLodUv(primitive, p1); c = terrainLodUv(primitive, p2);
+    } else {
+        ConstPtr<float2> uvs = ConstPtr<float2>(section.uvAddr);
+        a = uvs[3u*triangle]; b = uvs[3u*triangle+1u]; c = uvs[3u*triangle+2u];
+    }
+}
+
 // Entity geometry record: packed buffer addresses, motion, and per-geometry triangle bases. Entity BLAS
 // geometry order is opaque/any-hit; PrimitiveIndex restarts at zero for each geometry.
 public struct EntityGeom {

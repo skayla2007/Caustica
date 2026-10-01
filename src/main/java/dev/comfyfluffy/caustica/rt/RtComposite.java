@@ -574,6 +574,7 @@ public final class RtComposite {
         // the ready gate below, because it is what MAKES terrain ready during the initial fill.
         try {
             RtTerrain.frame(ctx);
+            dev.comfyfluffy.caustica.rt.terrain.RtVoxy.frame(ctx, new Matrix4f(frameProjection).mul(frameViewRotation), width, height);
         } catch (Throwable t) {
             ctx.gpuExecutor().throwIfFailed();
             failed = true;
@@ -1112,7 +1113,7 @@ public final class RtComposite {
             // generations are reclaimed by graphics-timeline completion.
             // Entity BLASes are built inline below and merged into the per-frame TLAS. geomTableAddr
             // feeds the hit shader entity path (per-prim normal/tint) and motion vectors.
-            RtEntities.FrameEntities fe = RtEntities.INSTANCE.beginFrame(ctx, terrain.staticInstances(),
+            RtEntities.FrameEntities fe = RtEntities.INSTANCE.beginFrame(ctx, dev.comfyfluffy.caustica.rt.terrain.RtVoxy.instances(terrain),
                     terrain.blockX, terrain.blockY, terrain.blockZ, camX, camY, camZ, frameProjection, frameViewRotation);
             frameEntities = fe;
             // Block-breaking overlay: resolves each destroy-stage RenderType's texture into the
@@ -1187,7 +1188,7 @@ public final class RtComposite {
             // WorldPush at all, and the RIS light buffers are read from world.rgen's hot inner loop, so
             // none of them should cost an extra BDA dereference to find.
             ByteBuffer pushConstants = stack.malloc(WorldPushConstantsData.BYTE_SIZE);
-            new WorldPushConstantsData(pushBuf.deviceAddress, terrain.tableAddress(), fe.geomTableAddr(),
+            new WorldPushConstantsData(pushBuf.deviceAddress, dev.comfyfluffy.caustica.rt.terrain.RtVoxy.tableAddress(terrain), fe.geomTableAddr(),
                     RtMaterialRegistry.INSTANCE.tableAddress(),
                     terrain.lightBufferAddress(), terrain.lightAliasBufferAddress(),
                     terrain.lightLocalAliasBufferAddress(), terrain.lightGridCellBufferAddress(),

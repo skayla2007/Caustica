@@ -158,7 +158,7 @@ public final class RtEntityTextures {
      * array is full. Deduping by handle is what bounds slot use: distinct render types backed by the same
      * texture share a slot instead of each consuming one.
      */
-    private int slotForView(long view) {
+    public int slotForView(long view) {
         if (view == 0L) {
             return 0;
         }

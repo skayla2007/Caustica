@@ -7,6 +7,7 @@
 // through worldPushAddr first would cost an extra global-memory load just to find the address of the
 // load we actually want. The cold WorldPush struct is dereferenced only for the breaking overlay.
 import world_common;
+import voxy;
 import math;
 import bindings;
 
@@ -332,7 +333,7 @@ void main(inout Payload payload, in BuiltInTriangleIntersectionAttributes attr) 
     // triangle base to land in the section's packed prim/uv arrays (concatenated in BUCKET order).
     // Water prims keep tint.w == 1, converted to the packed material enum below.
     uint pid = PrimitiveIndex() + sec.triBase[GeometryIndex()];
-    TerrainPrim pr = ConstPtr<TerrainPrim>(sec.primAddr)[pid];
+    TerrainPrim pr = terrainPrim(sec, pid);
     MaterialHeader materialHeader = ConstPtr<MaterialHeader>(pc.materialTableAddr)[pr.materialId];
     float3 n = normalize(pr.normal.xyz);
     float3 tint = pr.tint.rgb;
@@ -344,19 +345,36 @@ void main(inout Payload payload, in BuiltInTriangleIntersectionAttributes attr) 
     // orientation instead of toggling parity per crossing, so one malformed face cannot desync the path.
     bool entering = dot(WorldRayDirection(), n) < 0.0;
 
-    // Lever B: per-triangle corner UVs in primitive order. uvs[3*pid + k] is a contiguous,
-    // directly-addressed load (no index buffer, no scattered vertex-UV gather), so it issues as soon as
-    // pid is known and its latency overlaps the prim fetch instead of serialising behind an index load.
-    // The index buffer remains BLAS-only; shading reads the expanded UV buffer directly.
-    ConstPtr<float2> uvs = ConstPtr<float2>(sec.uvAddr);
-    float2 uv0 = uvs[3u * pid + 0u];
-    float2 uv1 = uvs[3u * pid + 1u];
-    float2 uv2 = uvs[3u * pid + 2u];
-    float3 bary = float3(1.0 - attribs.x - attribs.y, attribs.x, attribs.y);
-    float2 uv = bary.x * uv0 + bary.y * uv1 + bary.z * uv2;
+    // Real terrain stores corner UVs; Voxy's repeating UVs follow the provider's local voxel axes.
+    float2 uv0, uv1, uv2;
     float3 tp0 = HitTriangleVertexPosition(0);
     float3 tp1 = HitTriangleVertexPosition(1);
     float3 tp2 = HitTriangleVertexPosition(2);
+    terrainUvs(sec, pr, pid, tp0, tp1, tp2, uv0, uv1, uv2);
+    float3 bary = float3(1.0 - attribs.x - attribs.y, attribs.x, attribs.y);
+    float2 uv = bary.x * uv0 + bary.y * uv1 + bary.z * uv2;
+    if ((pr.flags & 2u) != 0u) {
+        float lod = clamp(rayConeTextureLod(rayCone, float2(16.0), tp0, tp1, tp2, uv0, uv1, uv2), 0.0, 3.0);
+        float4 texel = voxyTexel(pr, uv, lod);
+        float3 color = srgbToLinear(texel.rgb) * srgbToLinear(voxyTint(pr, texel));
+        uint model = materialHeader.model;
+        if (model == MATERIAL_WATER) color = srgbToLinear(pr.tint.rgb);
+        if (model == MATERIAL_DIELECTRIC) color = lerp(float3(1.0), color, texel.a);
+        if (dot(n, WorldRayDirection()) > 0.0) n = -n;
+        packAlbedo(payload, bt709ToAcesCg(color));
+        packNormal(payload, n);
+        payload.hitT = RayTCurrent();
+        payload.motionPrev = half3(0.0h);
+        payload.f0 = half3(lerp(float3(0.04), color, materialHeader.params.y));
+        float strength = float((materialHeader.features >> MATERIAL_EMISSION_STRENGTH_SHIFT) & MATERIAL_EMISSION_STRENGTH_MASK)
+                * (MATERIAL_MAX_EMISSION_STRENGTH / float(MATERIAL_EMISSION_STRENGTH_MASK));
+        float emission = pr.normal.w * strength;
+        payloadSetPacked(payload, model, materialHeader.params.x, materialHeader.params.y,
+                emission, 0.0, materialHeader.params.z, materialHeader.params.w,
+                emission > 0.0 ? EMISSION_SOURCE_UNIFORM : EMISSION_SOURCE_NONE);
+        payloadSetDielectric(payload, model, entering);
+        return;
+    }
     float blockLod = rayConeTextureLod(rayCone, texSizePx(blockAlbedoAtlas), tp0, tp1, tp2, uv0, uv1, uv2);
 
     // Orient the GEOMETRIC normal toward the viewer FIRST (double-sided geometry), so the normal-map TBN

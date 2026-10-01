@@ -239,7 +239,11 @@ final class RtTerrainMesher {
     /** Worker-packed terrain payload; native preparation allocates buffers and bulk-copies these arrays.
      *  {@code lights} = packed section-local RIS light records (possibly empty), CPU-side only. */
     record PackedSection(float[] positions, int[] indices, float[] uvs, float[] material,
-                         int[] bucketTris, int[] triBase, float[] lights) {
+                         int[] bucketTris, int[] triBase, float[] lights, boolean compactVoxy) {
+        PackedSection(float[] positions, int[] indices, float[] uvs, float[] material,
+                      int[] bucketTris, int[] triBase, float[] lights) {
+            this(positions, indices, uvs, material, bucketTris, triBase, lights, false);
+        }
     }
 
 

@@ -12,6 +12,7 @@
 // a trace. Shadow traversal uses albedo.rgb as accumulated transmittance and hitT as the nearest-water
 // crossing; radiance cutout paths do not touch either field.
 import world_common;
+import voxy;
 import math;
 import bindings;
 
@@ -64,7 +65,7 @@ void main(inout Payload payload, in BuiltInTriangleIntersectionAttributes attr) 
         int texSlot = int(epr.tint.w + 0.5);
         float4 texel = entityAlbedoTex[NonUniformResourceIndex(texSlot)].SampleLevel(uv, 0.0);
         bool stochasticAlpha = false;
-        MaterialHeader materialHeader;
+        MaterialHeader materialHeader = (MaterialHeader)0;
         if (instanceKind == ENTITY_BIT) {
             materialHeader = ConstPtr<MaterialHeader>(pc.materialTableAddr)[epr.materialId];
             stochasticAlpha = (materialHeader.features & MATERIAL_FEATURE_STOCHASTIC_ALPHA) != 0u;
@@ -105,6 +106,22 @@ void main(inout Payload payload, in BuiltInTriangleIntersectionAttributes attr) 
     Section sec = ConstPtr<Section>(pc.tableAddr)[InstanceID()];
     uint bucket = GeometryIndex();
     uint tri = pid + sec.triBase[bucket];
+
+    TerrainPrim lodPrim = terrainPrim(sec, tri);
+    if ((lodPrim.flags & 2u) != 0u) {
+        float2 lodUv = terrainLodUv(lodPrim, ObjectRayOrigin() + RayTCurrent() * ObjectRayDirection());
+        float4 texel = voxyTexel(lodPrim, lodUv, 0.0);
+        if (bucket == BUCKET_WATER || bucket == BUCKET_TRANSLUCENT) {
+            float3 color = bucket == BUCKET_WATER ? lodPrim.tint.rgb : texel.rgb * voxyTint(lodPrim, texel);
+            float strength = bucket == BUCKET_WATER ? WATER_SHADOW_TINT : texel.a;
+            packAlbedo(payload, unpackAlbedo(payload) * lerp(float3(1.0), bt709ToAcesCg(srgbToLinear(color)), strength));
+            if (bucket == BUCKET_WATER) payload.hitT = payload.hitT < 0.0 ? RayTCurrent() : min(payload.hitT, RayTCurrent());
+            IgnoreHit();
+        } else if (texel.a < ALPHA_CUTOFF) {
+            IgnoreHit();
+        }
+        return;
+    }
 
     // Water radiance rays use a closest-hit-only SBT record. Shadow rays run this record: tint sunlight by
     // the biome water color, then keep walking so submerged terrain is lit by colored transmission.

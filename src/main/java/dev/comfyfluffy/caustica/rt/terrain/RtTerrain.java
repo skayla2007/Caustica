@@ -168,6 +168,7 @@ public final class RtTerrain {
     private long buildToken;
     private long dirtyGroupSeq;
     private final RtSectionTable table = new RtSectionTable();
+    private long instanceRevision;
     private boolean ready;
     // Full-residency invalidation requested off the render thread. Wired to Fabric's
     // InvalidateRenderStateCallback = vanilla LevelExtractor.allChanged() (dimension change via setLevel,
@@ -230,10 +231,25 @@ public final class RtTerrain {
         return table.instances;
     }
 
+    long instanceRevision() { return instanceRevision; }
+
     /** Section table device address: {@code {u64 primAddr, u64 uvAddr, u32 triBase[4]}} per section, indexed by gl_InstanceCustomIndexEXT. */
     public long tableAddress() {
         return table.address();
     }
+
+    /** Owned render-thread snapshot for external geometry conversion workers. */
+    static LongSet readySectionSnapshot() {
+        LongOpenHashSet result = new LongOpenHashSet();
+        if (INSTANCE.ready) {
+            for (long key : INSTANCE.published) if (INSTANCE.resident.containsKey(key)) result.add(key);
+            result.addAll(INSTANCE.empty);
+        }
+        return result;
+    }
+
+    int tableCapacity() { return table.capacity; }
+    long tableMappedAddress() { return table.buffer.mapped; }
 
     /** RIS-sampled global light buffer device address, or 0 while no lights are published. */
     public long lightBufferAddress() {
@@ -1472,6 +1488,7 @@ public final class RtTerrain {
 
     private void applyBuildChanges(RtContext ctx, List<PreparedSection> prepared, List<SectionGeom> removed,
                                    boolean rebase, int rbx, int rby, int rbz) {
+        instanceRevision++;
         GraphicsUse lastGraphicsUse = ctx.gpuExecutor().latestGraphicsUse();
         int baseX = rebase ? rbx : blockX;
         int baseY = rebase ? rby : blockY;
@@ -1669,6 +1686,7 @@ public final class RtTerrain {
 
     /** Full teardown (world exit / shutdown): drain the GPU, then free everything incl. an in-flight build. */
     private void clear(RtContext ctx, boolean shutdown) {
+        RtVoxy.clear(ctx);
         if (!shutdown) {
             clearAsync(ctx);
             return;

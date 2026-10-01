@@ -149,6 +149,8 @@ public final class RtAccel {
         destroyed = true;
     }
 
+    public long allocatedBytes() { return backing.size; }
+
     private OpacityMicromap detachOpacityMicromap() {
         OpacityMicromap result = opacityMicromap;
         opacityMicromap = null;
@@ -1091,6 +1093,42 @@ public final class RtAccel {
         }
     }
 
+    /** Independent immutable terrain builds with disjoint AS and scratch storage; no micromap dependency. */
+    public static void recordImmutableTerrainBuilds(RtContext ctx, VkCommandBuffer cmd, List<PreparedBlas> blas) {
+        for (PreparedBlas b : blas) {
+            if (!b.terrainSplit || b.update || b.opacityMicromap != null)
+                throw new IllegalArgumentException("Terrain batch requires independent immutable geometry");
+            if (b.requestsCompaction()) VK10.vkCmdResetQueryPool(cmd, b.accel.compactionQueryPool, 0, 1);
+        }
+        try (RtDebugLabels.Scope ignored = RtDebugLabels.scope(ctx, cmd, "Independent terrain BLAS builds " + blas.size())) {
+            for (int offset = 0; offset < blas.size(); offset += 32) {
+                try (MemoryStack stack = MemoryStack.stackPush()) {
+                    int count = Math.min(32, blas.size() - offset);
+                    var infos = VkAccelerationStructureBuildGeometryInfoKHR.calloc(count, stack);
+                    PointerBuffer ranges = stack.mallocPointer(count);
+                    for (int i = 0; i < count; i++) {
+                        PreparedBlas b = blas.get(offset + i);
+                        var geometry = terrainGeometries(stack, b.vertexAddr, b.indexAddr, b.maxVertex + 1, b.terrainTris, null);
+                        infos.get(i).sType$Default().type(VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR)
+                                .flags(buildFlags(false) | (b.requestsCompaction() ? VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_COMPACTION_BIT_KHR : 0))
+                                .mode(VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR)
+                                .geometryCount(geometry.capacity()).pGeometries(geometry).dstAccelerationStructure(b.accel.handle);
+                        infos.get(i).scratchData().deviceAddress(scratchAddress(ctx, b.scratch));
+                        ranges.put(i, terrainBuildRanges(stack, b.terrainTris).address());
+                    }
+                    vkCmdBuildAccelerationStructuresKHR(cmd, infos, ranges);
+                }
+            }
+            try (MemoryStack stack = MemoryStack.stackPush()) { accelerationStructureBuildBarrier(cmd, stack); }
+            for (PreparedBlas b : blas) if (b.requestsCompaction()) {
+                try (MemoryStack stack = MemoryStack.stackPush()) {
+                    vkCmdWriteAccelerationStructuresPropertiesKHR(cmd, stack.longs(b.accel.handle),
+                            VK_QUERY_TYPE_ACCELERATION_STRUCTURE_COMPACTED_SIZE_KHR, b.accel.compactionQueryPool, 0);
+                }
+            }
+        }
+    }
+
     /** Free the transient scratch buffers of a set of prepared BLAS (only after their build completed). */
     public static void freeBlasScratch(List<PreparedBlas> blas) {
         for (PreparedBlas b : blas) {
@@ -1101,16 +1139,23 @@ public final class RtAccel {
     /** Record the compact copy after {@link #prepareTerrainCompaction} has sized its destination. */
     public static void recordTerrainCompaction(RtContext ctx, VkCommandBuffer cmd,
                                                PreparedTerrainCompaction compaction) {
+        recordTerrainCompactions(ctx, cmd, List.of(compaction));
+    }
+
+    /** Independent compact copies share a single dependency on the completed source builds. */
+    public static void recordTerrainCompactions(RtContext ctx, VkCommandBuffer cmd, List<PreparedTerrainCompaction> compactions) {
+        try (MemoryStack stack = MemoryStack.stackPush()) { accelerationStructureBuildBarrier(cmd, stack); }
+        for (PreparedTerrainCompaction compaction : compactions) {
         try (MemoryStack stack = MemoryStack.stackPush();
              RtDebugLabels.Scope ignored = RtDebugLabels.scope(ctx, cmd,
                      compaction.source.label + " compact")) {
-            accelerationStructureBuildBarrier(cmd, stack);
             VkCopyAccelerationStructureInfoKHR copy = VkCopyAccelerationStructureInfoKHR.calloc(stack)
                     .sType$Default()
                     .src(compaction.source.accel.handle)
                     .dst(compaction.compacted.accel.handle)
                     .mode(VK_COPY_ACCELERATION_STRUCTURE_MODE_COMPACT_KHR);
             vkCmdCopyAccelerationStructureKHR(cmd, copy);
+        }
         }
     }
 

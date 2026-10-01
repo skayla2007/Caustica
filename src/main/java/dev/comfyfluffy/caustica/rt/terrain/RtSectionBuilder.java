@@ -29,7 +29,11 @@ final class RtSectionBuilder {
                                    RtAccel.OpacityMicromapInput ommInput,
                                    boolean compactBlas,
                                    long key, int sox, int soy, int soz) {
-        RtMaterialAbi.requireTriangleParity(packed.material().length, packed.indices().length);
+        if (packed.compactVoxy()) {
+            if (packed.indices().length % 6 != 0 || packed.material().length != packed.indices().length / 6 * 3 ||
+                    packed.uvs().length != 1)
+                throw new IllegalArgumentException("Compact Voxy attributes must contain three words per quad");
+        } else RtMaterialAbi.requireTriangleParity(packed.material().length, packed.indices().length);
         int vertCount = packed.positions().length / 3;
         int asInput = org.lwjgl.vulkan.KHRAccelerationStructure
                 .VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR;

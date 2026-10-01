@@ -59,7 +59,7 @@ public final class RtContext {
     private final VulkanQueue graphicsQueue;
     private final VulkanQueue computeQueue;
     /** Serializes device-wide host waits against submissions from the Caustica compute thread. */
-    private final Object deviceQueueHostLock = new Object();
+    private final Object deviceQueueHostLock = dev.comfyfluffy.caustica.rt.terrain.RtVoxy.deviceHostLock();
     private final RtGpuExecutor gpuExecutor;
     private final int shaderGroupHandleSize;
     private final int shaderGroupBaseAlignment;

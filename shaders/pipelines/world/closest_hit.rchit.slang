@@ -345,16 +345,12 @@ void main(inout Payload payload, in BuiltInTriangleIntersectionAttributes attr) 
     // orientation instead of toggling parity per crossing, so one malformed face cannot desync the path.
     bool entering = dot(WorldRayDirection(), n) < 0.0;
 
-    // Real terrain stores corner UVs; Voxy's repeating UVs follow the provider's local voxel axes.
-    float2 uv0, uv1, uv2;
-    float3 tp0 = HitTriangleVertexPosition(0);
-    float3 tp1 = HitTriangleVertexPosition(1);
-    float3 tp2 = HitTriangleVertexPosition(2);
-    terrainUvs(sec, pr, pid, tp0, tp1, tp2, uv0, uv1, uv2);
-    float3 bary = float3(1.0 - attribs.x - attribs.y, attribs.x, attribs.y);
-    float2 uv = bary.x * uv0 + bary.y * uv1 + bary.z * uv2;
     if ((pr.flags & 2u) != 0u) {
-        float lod = clamp(rayConeTextureLod(rayCone, float2(16.0), tp0, tp1, tp2, uv0, uv1, uv2), 0.0, 3.0);
+        // Provider quads use axis-aligned repeating UVs, including fractional model bounds.
+        float2 uv = terrainLodUv(pr, ObjectRayOrigin() + RayTCurrent() * ObjectRayDirection());
+        float texelsPerWorld = 16.0 / float(1u << ((pr.aux1 >> 5) & 7u));
+        float lod = clamp(log2(max(rayConeHitWidth(rayCone) * texelsPerWorld,
+                RAY_CONE_MIN_TEXEL_FOOTPRINT)), 0.0, 3.0);
         float4 texel = voxyTexel(pr, uv, lod);
         float3 color = srgbToLinear(texel.rgb) * srgbToLinear(voxyTint(pr, texel));
         uint model = materialHeader.model;
@@ -375,6 +371,13 @@ void main(inout Payload payload, in BuiltInTriangleIntersectionAttributes attr) 
         payloadSetDielectric(payload, model, entering);
         return;
     }
+    float2 uv0, uv1, uv2;
+    float3 tp0 = HitTriangleVertexPosition(0);
+    float3 tp1 = HitTriangleVertexPosition(1);
+    float3 tp2 = HitTriangleVertexPosition(2);
+    terrainUvs(sec, pr, pid, tp0, tp1, tp2, uv0, uv1, uv2);
+    float3 bary = float3(1.0 - attribs.x - attribs.y, attribs.x, attribs.y);
+    float2 uv = bary.x * uv0 + bary.y * uv1 + bary.z * uv2;
     float blockLod = rayConeTextureLod(rayCone, texSizePx(blockAlbedoAtlas), tp0, tp1, tp2, uv0, uv1, uv2);
 
     // Orient the GEOMETRIC normal toward the viewer FIRST (double-sided geometry), so the normal-map TBN

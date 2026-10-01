@@ -30,9 +30,10 @@ final class RtSectionBuilder {
                                    boolean compactBlas,
                                    long key, int sox, int soy, int soz) {
         if (packed.compactVoxy()) {
-            if (packed.indices().length % 6 != 0 || packed.material().length != packed.indices().length / 6 * 3 ||
-                    packed.uvs().length != 1)
-                throw new IllegalArgumentException("Compact Voxy attributes must contain three words per quad");
+            int wordsPerQuad = packed.uvs().length == 1 ? 3 : 1;
+            if (packed.indices().length % 6 != 0 || packed.material().length != packed.indices().length / 6 * wordsPerQuad ||
+                    (wordsPerQuad == 1 && (packed.uvs().length == 0 || packed.uvs().length % 3 != 0)))
+                throw new IllegalArgumentException("Voxy quads require one palette index and three-word palette records");
         } else RtMaterialAbi.requireTriangleParity(packed.material().length, packed.indices().length);
         int vertCount = packed.positions().length / 3;
         int asInput = org.lwjgl.vulkan.KHRAccelerationStructure
@@ -74,7 +75,8 @@ final class RtSectionBuilder {
             upload.flush();
 
             blas = RtAccel.prepareTerrainBlas(ctx, positions, vertCount, indices,
-                    packed.bucketTris(), ommInput, compactBlas, label + " BLAS");
+                    packed.bucketTris(), ommInput, compactBlas, label + " BLAS",
+                    !packed.compactVoxy() || Boolean.getBoolean("caustica.voxy.positionFetch"));
             return new PreparedSection(key, positions, indices, uvs, material, upload, blas,
                     packed.triBase(), sox, soy, soz, packed.lights());
         } catch (Throwable t) {

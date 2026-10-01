@@ -297,10 +297,9 @@ public final class RtComposite {
     private float moonU1 = 1f;
     private float moonV1 = 1f;
 
-    // Per-frame TLAS resources, rebuilt in place from a small ring of persistent slots (see
-    // RtAccel.TlasRing — replaces the old create-and-defer-destroy-per-frame churn whose VMA slow path
-    // showed up as rare multi-ms prepareTlas spikes).
+    // Persistent TLAS slots wait for prior graphics use before rebuilding or refitting in place.
     private final RtAccel.TlasRing tlasRing = new RtAccel.TlasRing();
+    private RtGpuTimings gpuTimings;
 
     // This frame's TLAS handle, published after prepareTlas so the world-overlay pass (block outline's
     // rayQueryEXT occlusion test) can bind the exact same acceleration structure the primary trace used —
@@ -1057,6 +1056,10 @@ public final class RtComposite {
             pushSlot = (pushSlot + 1) % PUSH_RING;
             PushSlot selectedPushSlot = pushRing[pushSlot];
             graphicsUseWaiter.await(selectedPushSlot.graphicsUse);
+            if (RtGpuTimings.ENABLED) {
+                if (gpuTimings == null) gpuTimings = new RtGpuTimings(ctx, PUSH_RING);
+                gpuTimings.begin(cmd, pushSlot);
+            }
             selectedPushSlot.graphicsUse.mark(graphicsUse);
             RtBuffer pushBuf = selectedPushSlot.buffer;
             ByteBuffer push = MemoryUtil.memByteBuffer(pushBuf.mapped, WORLD_PUSH_SIZE);
@@ -1106,10 +1109,9 @@ public final class RtComposite {
             Float4 waterAnchor = new Float4(terrain.blockX & WATER_ANCHOR_MASK,
                     terrain.blockZ & WATER_ANCHOR_MASK, priorWaterWaveTime, 0f);
 
-            // Rebuild the TLAS this frame from static section instances merged with dynamic entity
-            // instances, bind it into the pipeline's descriptor ring, record the build, then barrier so
-            // the trace sees the finished TLAS. Section BLASes are already built (async, by RtTerrain);
-            // only the cheap instance-level TLAS is rebuilt per frame. Retired terrain geometry/table
+            // Build or refit the TLAS from static sections and dynamic entities, then barrier before
+            // tracing. Stable terrain/counts permit UPDATE; changed generations require BUILD.
+            // Section BLASes are already built asynchronously. Retired terrain geometry/table
             // generations are reclaimed by graphics-timeline completion.
             // Entity BLASes are built inline below and merged into the per-frame TLAS. geomTableAddr
             // feeds the hit shader entity path (per-prim normal/tint) and motion vectors.
@@ -1171,6 +1173,7 @@ public final class RtComposite {
                 VulkanCommandEncoder.memoryBarrier(cmd, stack); // entity BLAS writes visible to the TLAS build
             }
             RtAccel.PreparedTlas frameTlas;
+            if (gpuTimings != null) gpuTimings.mark(cmd, pushSlot, 1);
             try (RtFrameStats.Scope ignored = RtFrameStats.FRAME.stage("frame.prepareTlas")) {
                 frameTlas = RtAccel.prepareTlas(ctx, fe.baseInstances(), fe.dynamicInstances(), tlasRing,
                         graphicsUse);
@@ -1181,6 +1184,7 @@ public final class RtComposite {
                 RtAccel.recordTlasBuild(ctx, cmd, frameTlas);
             }
             VulkanCommandEncoder.memoryBarrier(cmd, stack); // TLAS build visible to the trace
+            if (gpuTimings != null) gpuTimings.mark(cmd, pushSlot, 2);
 
             // Push the BDA ring slot's address plus the small hot subset used directly by the shaders.
             // Every 64-bit device address the trace needs lives here, not behind worldPushAddr: the
@@ -1202,16 +1206,19 @@ public final class RtComposite {
             }
             VulkanCommandEncoder.memoryBarrier(cmd, stack); // sky LUT writes visible to raygen/miss
 
+            if (gpuTimings != null) gpuTimings.mark(cmd, pushSlot, 3);
             try (RtDebugLabels.Scope ignored = RtDebugLabels.scope(ctx, cmd, "world primary trace");
                  RtFrameStats.Scope ignoredStats = RtFrameStats.FRAME.stage("frame.tracePrimary")) {
                 active.trace(cmd, renderW, renderH, pushConstants, 0);
             }
             VulkanCommandEncoder.memoryBarrier(cmd, stack); // continuation/guide writes visible to pass B
+            if (gpuTimings != null) gpuTimings.mark(cmd, pushSlot, 4);
             try (RtDebugLabels.Scope ignored = RtDebugLabels.scope(ctx, cmd, "world indirect trace");
                  RtFrameStats.Scope ignoredStats = RtFrameStats.FRAME.stage("frame.traceIndirect")) {
                 active.trace(cmd, renderW, renderH, pushConstants, 1);
             }
             VulkanCommandEncoder.memoryBarrier(cmd, stack); // RT writes visible to DLSS reads
+            if (gpuTimings != null) gpuTimings.mark(cmd, pushSlot, 5);
             // DLSS-RR denoise + upscale. The RT pass wrote noisy color (render res) + guides;
             // RR reads them and writes the display-res denoised result straight into rrOutput.
             if (rrPath && RtDlssRr.INSTANCE.ensureFeature(cmd.address(), renderW, renderH, displayW, displayH)) {
@@ -1235,6 +1242,7 @@ public final class RtComposite {
                 }
             }
             VulkanCommandEncoder.memoryBarrier(cmd, stack); // rrOutput visible to exposure histogram
+            if (gpuTimings != null) gpuTimings.mark(cmd, pushSlot, 6);
 
             // Auto-exposure meters rrOutput (the post-RR, denoised/converged image), not the raw
             // pre-RR trace: RR has no notion of exposure (DLSS-RR Integration Guide §3.7 — ignore
@@ -1290,6 +1298,7 @@ public final class RtComposite {
             }
             VulkanCommandEncoder.memoryBarrier(cmd, stack);
         }
+        if (gpuTimings != null) gpuTimings.mark(cmd, pushSlot, 7);
         if (VK10.vkEndCommandBuffer(cmd) != VK10.VK_SUCCESS) {
             throw new IllegalStateException("vkEndCommandBuffer(rt composite) failed");
         }
@@ -1465,6 +1474,7 @@ public final class RtComposite {
         // Teardown runs after the device is idle (CLIENT_STOPPING waits), so the TLAS ring's slots are no
         // longer in flight and can be freed immediately.
         tlasRing.destroy();
+        if (gpuTimings != null) { gpuTimings.destroy(); gpuTimings = null; }
         if (RtDlssRr.enabled()) {
             RtDlssRr.INSTANCE.destroy();
         }

@@ -108,6 +108,7 @@ public final class RtVoxy {
         private static final boolean PROFILE = Boolean.getBoolean("caustica.voxy.profile");
         private long profileAt = System.nanoTime(), profileFrames, providerNs, prepareNs, selectionNs;
         private long dispatchedEmpty, dispatchedGeometry, preparedCount;
+        private dev.comfyfluffy.caustica.rt.RtMemoryBudget memoryBudget;
         private LodScene sortedScene;
         private List<LodMesh> sortedCandidates = List.of();
         private double sortedX, sortedY, sortedZ;
@@ -292,6 +293,10 @@ public final class RtVoxy {
                 profileFrames++; providerNs += afterProvider - profileStart;
                 prepareNs += afterPrepare - afterProvider; selectionNs += now - afterPrepare;
                 if (now - profileAt > 2_000_000_000L) {
+                    if (memoryBudget == null) memoryBudget = new dev.comfyfluffy.caustica.rt.RtMemoryBudget(ctx);
+                    var budget = memoryBudget.read();
+                    CausticaMod.LOGGER.info("RT memory budget localUsageMiB={} localBudgetMiB={} nonLocalUsageMiB={}",
+                            budget.localUsage()/1048576, budget.localBudget()/1048576, budget.nonLocalUsage()/1048576);
                     long targetQuads = 0, ancestorQuads = 0, residentBytes = 0, blasBytes = 0;
                     int empty = 0, readyTargets = 0;
                     for (LodMesh m : scene.meshes()) {
@@ -383,7 +388,8 @@ public final class RtVoxy {
                     var p = active.get(i).prepared;
                     long address = table.mapped + (offset + (long) i) * 32;
                     MemoryUtil.memPutLong(address, p.material().deviceAddress);
-                    MemoryUtil.memPutLong(address + 8, p.uvs().deviceAddress | 1L);
+                    // Low address bits tag analytic LOD UVs and direct versus palette attributes.
+                    MemoryUtil.memPutLong(address + 8, p.uvs().deviceAddress | (p.uvs().size == 4 ? 3L : 1L));
                     for (int b = 0; b < 4; b++) MemoryUtil.memPutInt(address + 16 + b * 4L, p.triBase()[b]);
                 }
                 table.flush();

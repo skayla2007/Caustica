@@ -57,6 +57,7 @@ loom {
 
 dependencies {
 	compileOnly fileTree("../voxy/build/libs") { include "voxy-*.jar"; exclude "*-sources.jar" }
+	testImplementation fileTree("../voxy/build/libs") { include "voxy-*.jar"; exclude "*-sources.jar" }
 	if (project.hasProperty("voxyRuntime")) {
 		runtimeOnly fileTree("../voxy/build/libs") { include "voxy-*.jar"; exclude "*-sources.jar" }
 	}

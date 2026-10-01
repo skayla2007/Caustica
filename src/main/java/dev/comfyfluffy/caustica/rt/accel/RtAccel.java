@@ -76,7 +76,7 @@ import static org.lwjgl.vulkan.KHRSynchronization2.vkCmdPipelineBarrier2KHR;
 
 /**
  * A built acceleration structure (BLAS or TLAS) plus its backing buffer. Build with the static
- * factories; free with {@link #destroy()}. One BLAS per section; one TLAS rebuilt per frame.
+ * factories; free with {@link #destroy()}. Each section owns a BLAS; frame TLAS slots build or refit.
  */
 public final class RtAccel {
     private static final long TLAS_INSTANCE_ADDRESS_ALIGNMENT = 16L;
@@ -282,17 +282,18 @@ public final class RtAccel {
         private final boolean entitySplit;
         private final int[] entityTris; // opaque/any-hit counts (null if !entitySplit)
         private final OpacityMicromap opacityMicromap; // optional, terrain cutout bucket only
+        private final boolean positionFetch;
 
         private PreparedBlas(RtAccel accel, RtBuffer scratch, RtBuffer externalBacking, long vertexAddr, long indexAddr,
                              int maxVertex, int triangleCount, boolean opaque, String label, boolean updatable, boolean update) {
             this(accel, scratch, externalBacking, vertexAddr, indexAddr, maxVertex, triangleCount, opaque, label,
-                    updatable, update, false, null, false, null, null);
+                    updatable, update, false, null, false, null, null, true);
         }
 
         private PreparedBlas(RtAccel accel, RtBuffer scratch, RtBuffer externalBacking, long vertexAddr, long indexAddr,
                              int maxVertex, int triangleCount, boolean opaque, String label, boolean updatable, boolean update,
                              boolean terrainSplit, int[] terrainTris, boolean entitySplit, int[] entityTris,
-                             OpacityMicromap opacityMicromap) {
+                             OpacityMicromap opacityMicromap, boolean positionFetch) {
             this.accel = accel;
             this.scratch = scratch;
             this.externalBacking = externalBacking;
@@ -309,17 +310,24 @@ public final class RtAccel {
             this.entitySplit = entitySplit;
             this.entityTris = entityTris;
             this.opacityMicromap = opacityMicromap;
+            this.positionFetch = positionFetch;
         }
 
         /** A terrain section BLAS split into fixed per-bucket geometries in {@link RtAccel#TERRAIN_BUCKETS} order. */
         static PreparedBlas terrain(RtAccel accel, RtBuffer scratch, RtBuffer externalBacking, long vertexAddr, long indexAddr, int maxVertex,
                                     int[] terrainTris, OpacityMicromap opacityMicromap, String label) {
+            return terrain(accel, scratch, externalBacking, vertexAddr, indexAddr, maxVertex, terrainTris,
+                    opacityMicromap, label, true);
+        }
+
+        static PreparedBlas terrain(RtAccel accel, RtBuffer scratch, RtBuffer externalBacking, long vertexAddr, long indexAddr, int maxVertex,
+                                    int[] terrainTris, OpacityMicromap opacityMicromap, String label, boolean positionFetch) {
             int total = 0;
             for (int t : terrainTris) {
                 total += t;
             }
             return new PreparedBlas(accel, scratch, externalBacking, vertexAddr, indexAddr, maxVertex,
-                    total, false, label, false, false, true, terrainTris, false, null, opacityMicromap);
+                    total, false, label, false, false, true, terrainTris, false, null, opacityMicromap, positionFetch);
         }
 
         static PreparedBlas entity(RtAccel accel, RtBuffer scratch, RtBuffer externalBacking, long vertexAddr,
@@ -328,7 +336,7 @@ public final class RtAccel {
             int total = 0;
             for (int t : entityTris) total += t;
             return new PreparedBlas(accel, scratch, externalBacking, vertexAddr, indexAddr, maxVertex,
-                    total, false, label, updatable, update, false, null, true, entityTris, null);
+                    total, false, label, updatable, update, false, null, true, entityTris, null, true);
         }
 
         public boolean requestsCompaction() {
@@ -407,6 +415,14 @@ public final class RtAccel {
     public static PreparedBlas prepareTerrainBlas(RtContext ctx, RtBuffer positions, int vertexCount,
                                                   RtBuffer indices, int[] bucketTris, OpacityMicromapInput opacityMicromapInput,
                                                   boolean compact, String label) {
+        return prepareTerrainBlas(ctx, positions, vertexCount, indices, bucketTris, opacityMicromapInput,
+                compact, label, true);
+    }
+
+    /** Planar provider geometry can reconstruct surface coordinates without fetching BLAS vertices. */
+    public static PreparedBlas prepareTerrainBlas(RtContext ctx, RtBuffer positions, int vertexCount,
+                                                  RtBuffer indices, int[] bucketTris, OpacityMicromapInput opacityMicromapInput,
+                                                  boolean compact, String label, boolean positionFetch) {
         VkDevice vk = ctx.vk();
         String debugLabel = labelOr(label, "terrain BLAS");
         OpacityMicromap opacityMicromap = null;
@@ -416,7 +432,7 @@ public final class RtAccel {
         try (MemoryStack stack = MemoryStack.stackPush()) {
             opacityMicromap = prepareOpacityMicromap(ctx, opacityMicromapInput, debugLabel);
             VkAccelerationStructureBuildSizesInfoKHR sizes = queryTerrainBlasSizes(vk, stack, positions, indices,
-                    vertexCount, bucketTris, opacityMicromap, compact);
+                    vertexCount, bucketTris, opacityMicromap, compact, positionFetch);
             backing = ctx.createAsyncBuffer(sizes.accelerationStructureSize(), VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR, false,
                     debugLabel + " backing");
             scratch = createScratchBuffer(ctx, sizes.buildScratchSize(), debugLabel + " build scratch");
@@ -432,7 +448,7 @@ public final class RtAccel {
                         debugLabel + " compacted-size query");
             }
             return PreparedBlas.terrain(accel, scratch, null, positions.deviceAddress, indices.deviceAddress, vertexCount - 1,
-                    bucketTris, opacityMicromap, debugLabel);
+                    bucketTris, opacityMicromap, debugLabel, positionFetch);
         } catch (Throwable t) {
             if (accel != null) {
                 accel.destroy();
@@ -480,7 +496,7 @@ public final class RtAccel {
             compactedAccel.opacityMicromap = opacityMicromap;
             PreparedBlas compacted = PreparedBlas.terrain(compactedAccel, source.scratch, null,
                     source.vertexAddr, source.indexAddr, source.maxVertex, source.terrainTris,
-                    opacityMicromap, source.label);
+                    opacityMicromap, source.label, source.positionFetch);
             return new PreparedTerrainCompaction(source, compacted);
         } catch (Throwable t) {
             if (compactedAccel != null) {
@@ -723,12 +739,13 @@ public final class RtAccel {
     }
 
     private static int buildFlags(boolean allowUpdate) {
-        // ALLOW_DATA_ACCESS lets the closest-hit read vertex positions from the BLAS via
-        // gl_HitTriangleVertexPositionsEXT (VK_KHR_ray_tracing_position_fetch) for the normal-map TBN.
-        // Applied to every BLAS (terrain/entity) AND the refit path, so the build/UPDATE flags stay
-        // identical (a refit invariant) — this is the single shared flag source.
+        return buildFlags(allowUpdate, true);
+    }
+
+    private static int buildFlags(boolean allowUpdate, boolean positionFetch) {
+        // Build and size queries use identical flags; refittable real geometry retains data access.
         return VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR
-                | VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_DATA_ACCESS_BIT_KHR
+                | (positionFetch ? VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_DATA_ACCESS_BIT_KHR : 0)
                 | (allowUpdate ? VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT_KHR : 0);
     }
 
@@ -889,11 +906,18 @@ public final class RtAccel {
     private static VkAccelerationStructureBuildSizesInfoKHR queryTerrainBlasSizes(VkDevice vk, MemoryStack stack, RtBuffer positions,
                                                                                   RtBuffer indices, int vertexCount, int[] bucketTris,
                                                                                   OpacityMicromap opacityMicromap, boolean compact) {
+        return queryTerrainBlasSizes(vk, stack, positions, indices, vertexCount, bucketTris, opacityMicromap,
+                compact, true);
+    }
+
+    private static VkAccelerationStructureBuildSizesInfoKHR queryTerrainBlasSizes(VkDevice vk, MemoryStack stack, RtBuffer positions,
+                                                                                  RtBuffer indices, int vertexCount, int[] bucketTris,
+                                                                                  OpacityMicromap opacityMicromap, boolean compact, boolean positionFetch) {
         VkAccelerationStructureGeometryKHR.Buffer geom = terrainGeometries(stack, positions.deviceAddress, indices.deviceAddress,
                 vertexCount, bucketTris, opacityMicromap);
         VkAccelerationStructureBuildGeometryInfoKHR.Buffer build = VkAccelerationStructureBuildGeometryInfoKHR.calloc(1, stack);
         build.sType$Default().type(VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR)
-                .flags(buildFlags(false) | (compact ? VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_COMPACTION_BIT_KHR : 0))
+                .flags(buildFlags(false, positionFetch) | (compact ? VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_COMPACTION_BIT_KHR : 0))
                 .mode(VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR).geometryCount(geom.capacity()).pGeometries(geom);
         java.nio.IntBuffer maxPrims = stack.mallocInt(geom.capacity());
         for (int tris : bucketTris) {
@@ -930,14 +954,16 @@ public final class RtAccel {
         private final RtBuffer scratch;
         private final int instanceCount;
         private final String label;
+        private final boolean update;
 
         private PreparedTlas(RtAccel accel, RtBuffer instanceBuffer, RtBuffer scratch, int instanceCount,
-                             String label) {
+                             String label, boolean update) {
             this.accel = accel;
             this.instanceBuffer = instanceBuffer;
             this.scratch = scratch;
             this.instanceCount = instanceCount;
             this.label = label;
+            this.update = update;
         }
     }
 
@@ -958,6 +984,8 @@ public final class RtAccel {
             RtBuffer instanceBuffer;
             RtBuffer scratch;
             int capacity;
+            int instanceCount = -1;
+            List<Instance> baseInstances;
             final TrackedGraphicsUse graphicsUse = new TrackedGraphicsUse();
 
             void destroy() {
@@ -980,10 +1008,10 @@ public final class RtAccel {
 
     /**
      * Fill the next ring slot's instance buffer and return it as a build-ready TLAS (the slot's AS is
-     * rebuilt in place — BUILD mode overwrites). Do NOT call {@link PreparedTlas#destroyAll} on the
-     * result: the ring owns the resources.
+     * built or refitted in place). Changed terrain generations or instance counts require BUILD;
+     * stable generations/counts permit UPDATE. Terrain and dynamic instances occupy contiguous
+     * ranges in the instance buffer. The ring owns all resources.
      */
-    /** Pack terrain and dynamic instances as two contiguous ranges without a composite-list get per item. */
     public static PreparedTlas prepareTlas(RtContext ctx, List<Instance> baseInstances,
                                            List<Instance> dynamicInstances, TlasRing ring, GraphicsUse graphicsUse) {
         int baseCount = baseInstances.size();
@@ -1004,6 +1032,11 @@ public final class RtAccel {
         }
         ring.cursor = (ring.cursor + 1) % TlasRing.RING;
 
+        // Terrain instances reference immutable BLAS. A different list denotes a new terrain/rebase
+        // generation; rebuild its hierarchy, while same-count dynamic motion can refit the prior slot.
+        boolean update = slot.instanceCount == count && slot.baseInstances == baseInstances;
+        slot.instanceCount = count;
+        slot.baseInstances = baseInstances;
         writeTlasInstances(baseInstances, slot.instanceBuffer.mapped, 0);
         writeTlasInstances(dynamicInstances, slot.instanceBuffer.mapped, baseCount);
         if (count > 0) {
@@ -1011,7 +1044,7 @@ public final class RtAccel {
         }
         slot.graphicsUse.mark(graphicsUse);
         return new PreparedTlas(slot.accel, slot.instanceBuffer, slot.scratch, count,
-                "frame TLAS " + count + " instances");
+                "frame TLAS " + count + " instances", update);
     }
 
     // Wrap the mapped Vulkan array in LWJGL structs so its generated accessors own the native ABI/bitfields.
@@ -1055,7 +1088,7 @@ public final class RtAccel {
             RtContext.check(vkCreateAccelerationStructureKHR(vk, ci, null, pAs), "vkCreateAccelerationStructureKHR");
             long handle = pAs.get(0);
             RtDebugLabels.nameAccelerationStructure(ctx, handle, label);
-            slot.scratch = createScratchBuffer(ctx, sizes.buildScratchSize(), label + " build scratch");
+            slot.scratch = createScratchBuffer(ctx, Math.max(sizes.buildScratchSize(), sizes.updateScratchSize()), label + " build/refit scratch");
             VkAccelerationStructureDeviceAddressInfoKHR addrInfo = VkAccelerationStructureDeviceAddressInfoKHR.calloc(stack)
                     .sType$Default().accelerationStructure(handle);
             long deviceAddress = vkGetAccelerationStructureDeviceAddressKHR(vk, addrInfo);
@@ -1071,7 +1104,7 @@ public final class RtAccel {
         geom.geometry().instances().data().deviceAddress(instanceBufferAddr);
         VkAccelerationStructureBuildGeometryInfoKHR.Buffer build = VkAccelerationStructureBuildGeometryInfoKHR.calloc(1, stack);
         build.sType$Default().type(VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR)
-                .flags(VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR)
+                .flags(VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR | VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT_KHR)
                 .mode(VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR).geometryCount(1).pGeometries(geom);
         return build;
     }
@@ -1110,7 +1143,7 @@ public final class RtAccel {
                         PreparedBlas b = blas.get(offset + i);
                         var geometry = terrainGeometries(stack, b.vertexAddr, b.indexAddr, b.maxVertex + 1, b.terrainTris, null);
                         infos.get(i).sType$Default().type(VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR)
-                                .flags(buildFlags(false) | (b.requestsCompaction() ? VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_COMPACTION_BIT_KHR : 0))
+                                .flags(buildFlags(false, b.positionFetch) | (b.requestsCompaction() ? VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_COMPACTION_BIT_KHR : 0))
                                 .mode(VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR)
                                 .geometryCount(geometry.capacity()).pGeometries(geometry).dstAccelerationStructure(b.accel.handle);
                         infos.get(i).scratchData().deviceAddress(scratchAddress(ctx, b.scratch));
@@ -1174,6 +1207,8 @@ public final class RtAccel {
         try (MemoryStack stack = MemoryStack.stackPush()) {
             VkAccelerationStructureBuildGeometryInfoKHR.Buffer build = tlasBuildInfo(stack, tlas.instanceBuffer.deviceAddress);
             build.get(0).dstAccelerationStructure(tlas.accel.handle);
+            if (tlas.update) build.get(0).mode(VK_BUILD_ACCELERATION_STRUCTURE_MODE_UPDATE_KHR)
+                    .srcAccelerationStructure(tlas.accel.handle);
             build.get(0).scratchData().deviceAddress(scratchAddress(ctx, tlas.scratch));
             VkAccelerationStructureBuildRangeInfoKHR.Buffer range = VkAccelerationStructureBuildRangeInfoKHR.calloc(1, stack);
             range.get(0).primitiveCount(tlas.instanceCount).primitiveOffset(0).firstVertex(0).transformOffset(0);
@@ -1184,7 +1219,7 @@ public final class RtAccel {
 
     /** Record a labelled TLAS build into the command buffer. */
     public static void recordTlasBuild(RtContext ctx, VkCommandBuffer cmd, PreparedTlas tlas) {
-        try (RtDebugLabels.Scope ignored = RtDebugLabels.scope(ctx, cmd, tlas.label + " build")) {
+        try (RtDebugLabels.Scope ignored = RtDebugLabels.scope(ctx, cmd, tlas.label + (tlas.update ? " refit" : " build"))) {
             recordTlasBuildRaw(ctx, cmd, tlas);
         }
     }
@@ -1253,7 +1288,7 @@ public final class RtAccel {
                 b.maxVertex + 1, b.terrainTris, b.opacityMicromap);
         VkAccelerationStructureBuildGeometryInfoKHR.Buffer build = VkAccelerationStructureBuildGeometryInfoKHR.calloc(1, stack);
         build.sType$Default().type(VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR)
-                .flags(buildFlags(false) | (compact ? VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_COMPACTION_BIT_KHR : 0))
+                .flags(buildFlags(false, b.positionFetch) | (compact ? VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_COMPACTION_BIT_KHR : 0))
                 .mode(VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR)
                 .geometryCount(geom.capacity()).pGeometries(geom)
                 .dstAccelerationStructure(b.accel.handle);

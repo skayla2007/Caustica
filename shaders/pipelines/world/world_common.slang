@@ -267,8 +267,10 @@ public TerrainPrim terrainPrim(Section section, uint triangle) {
     if ((section.uvAddr & uint64_t(1)) == uint64_t(0))
         return ConstPtr<TerrainPrim>(section.primAddr)[triangle];
     ConstPtr<uint> words = ConstPtr<uint>(section.primAddr);
-    uint base = (triangle >> 1) * 3u;
-    uint3 data = uint3(words[base], words[base+1u], words[base+2u]);
+    bool direct = (section.uvAddr & uint64_t(3)) == uint64_t(3);
+    uint base = (direct ? (triangle >> 1) : words[triangle >> 1]) * 3u;
+    ConstPtr<uint> palette = direct ? words : ConstPtr<uint>(section.uvAddr & ~uint64_t(3));
+    uint3 data = uint3(palette[base], palette[base+1u], palette[base+2u]);
     uint face = (data.y >> 24) & 7u;
     uint axis = (face >> 1) == 0u ? 1u : (face >> 1) == 1u ? 2u : 0u;
     TerrainPrim result;

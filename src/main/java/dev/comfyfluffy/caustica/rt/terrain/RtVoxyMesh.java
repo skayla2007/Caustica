@@ -19,17 +19,32 @@ final class RtVoxyMesh {
         boolean clipRealSections = !realSections.isEmpty();
         Bucket[] buckets = {new Bucket(), new Bucket(), new Bucket(), new Bucket()};
         var raw = mesh.quads();
+        int previousModel = -1, material = 0;
+        LodModel model = null;
+        boolean water = false, glass = false;
+        float emission = 0;
         while (raw.hasRemaining()) {
             long packed = raw.get();
-            LodModel model = scene.models().get((int) (packed >>> 26) & 65535);
-            if (model == null) throw new IllegalStateException("Voxy published mesh before its model");
+            int modelId = (int) (packed >>> 26) & 65535;
+            if (modelId != previousModel) {
+                model = scene.models().get(modelId);
+                if (model == null) throw new IllegalStateException("Voxy published mesh before its model");
+                water = model.state().getFluidState().is(FluidTags.WATER) && model.state().getRenderShape() != net.minecraft.world.level.block.RenderShape.MODEL;
+                glass = !water && (model.flags() & 4) != 0;
+                material = water ? snapshot.waterId() : snapshot.resolve(null, model.state(), glass);
+                emission = model.state().getLightEmission() / 15f;
+                previousModel = modelId;
+            }
             LodQuad quad = LodQuad.decode(packed, model, mesh.level);
-            boolean water = model.state().getFluidState().is(FluidTags.WATER) && model.state().getRenderShape() != net.minecraft.world.level.block.RenderShape.MODEL;
-            boolean glass = !water && (model.flags() & 4) != 0;
             int bucket = water ? 3 : glass ? 2 : quad.cutout() ? 1 : 0;
-            int material = water ? snapshot.waterId() : snapshot.resolve(null, model.state(), glass);
             int tint = (model.flags() & 2) != 0 && model.tint() >= 0
                     ? scene.colour(model.tint() + quad.biome()) : model.tint();
+            if (!clipRealSections) {
+                float u = component(quad, quad.axisU()), v = component(quad, quad.axisV());
+                emit(buckets[bucket], quad, u, v, u + quad.width(), v + quad.height(), 1 << mesh.level,
+                        material, textureSlot, tint, emission);
+                continue;
+            }
             float[] p = {quad.x(), quad.y(), quad.z()};
             int[] origin = {mesh.originX(), mesh.originY(), mesh.originZ()};
             float uEnd = p[quad.axisU()] + quad.width(), vEnd = p[quad.axisV()] + quad.height();
@@ -45,8 +60,8 @@ final class RtVoxyMesh {
                             Math.floorDiv((int) Math.floor(origin[0] + center[0]), 16),
                             Math.floorDiv((int) Math.floor(origin[1] + center[1]), 16),
                             Math.floorDiv((int) Math.floor(origin[2] + center[2]), 16)));
-                    if (!covered) emit(buckets[bucket], quad, p, u, v, un, vn, 1 << mesh.level,
-                            material, textureSlot, tint, model.state().getLightEmission() / 15f);
+                    if (!covered) emit(buckets[bucket], quad, u, v, un, vn, 1 << mesh.level,
+                            material, textureSlot, tint, emission);
                     v = vn;
                 }
                 u = un;
@@ -60,30 +75,42 @@ final class RtVoxyMesh {
             bases[b] = indices.size() / 3;
             counts[b] = bucket.indices.size() / 3;
             int vertexBase = positions.size() / 3;
-            for (int i : bucket.indices) indices.add(vertexBase + i);
+            int[] elements = bucket.indices.elements();
+            for (int i = 0; i < bucket.indices.size(); i++) indices.add(vertexBase + elements[i]);
             positions.addAll(bucket.positions); materials.addAll(bucket.materials);
         }
-        return new RtTerrainMesher.PackedSection(positions.toFloatArray(), indices.toIntArray(), new float[1],
-                materials.toFloatArray(), counts, bases, new float[0], true);
+        var palette = RtVoxyAttributes.pack(materials.toFloatArray());
+        return new RtTerrainMesher.PackedSection(positions.toFloatArray(), indices.toIntArray(), palette.records(),
+                palette.indices(), counts, bases, new float[0], true);
     }
 
     private static float nextBoundary(float value, int origin) {
         return (float) ((Math.floor((origin + (double) value) / 16) + 1) * 16 - origin);
     }
 
-    private static void emit(Bucket bucket, LodQuad q, float[] p, float u, float v, float un, float vn,
+    private static float component(LodQuad q, int axis) {
+        return axis == 0 ? q.x() : axis == 1 ? q.y() : q.z();
+    }
+
+    static void appendPositions(FloatArrayList output, LodQuad q, float u, float v, float un, float vn) {
+        appendPoint(output, q, u, v);
+        appendPoint(output, q, un, v);
+        appendPoint(output, q, un, vn);
+        appendPoint(output, q, u, vn);
+    }
+
+    private static void appendPoint(FloatArrayList output, LodQuad q, float u, float v) {
+        output.add(q.axisU() == 0 ? u : q.axisV() == 0 ? v : q.x());
+        output.add(q.axisU() == 1 ? u : q.axisV() == 1 ? v : q.y());
+        output.add(q.axisU() == 2 ? u : q.axisV() == 2 ? v : q.z());
+    }
+
+    private static void emit(Bucket bucket, LodQuad q, float u, float v, float un, float vn,
                              float scale, int material, int texture, int tint, float emission) {
         int base = bucket.positions.size() / 3;
-        float[][] corners = {{u,v}, {un,v}, {un,vn}, {u,vn}};
-        for (float[] corner : corners) {
-            float[] point = p.clone();
-            point[q.axisU()] = corner[0]; point[q.axisV()] = corner[1];
-            bucket.positions.addElements(bucket.positions.size(), point);
-        }
-        int[] order = {0,1,2,0,2,3};
-        for (int i : order) {
-            bucket.indices.add(base + i);
-        }
+        appendPositions(bucket.positions, q, u, v, un, vn);
+        bucket.indices.add(base); bucket.indices.add(base + 1); bucket.indices.add(base + 2);
+        bucket.indices.add(base); bucket.indices.add(base + 2); bucket.indices.add(base + 3);
         RtVoxyAttributes.append(bucket.materials, material, tint, q.model(), q.face(), q.tintMode(), texture,
                 Integer.numberOfTrailingZeros((int)scale), emission);
     }

@@ -343,6 +343,9 @@ public final class RtAccel {
             return accel.compactionQueryPool != 0L;
         }
 
+        /** Allocation bytes present during the initial build, before compaction. */
+        public long buildWorkingBytes() { return accel.allocatedBytes() + scratch.size; }
+
         private void freeTransientBuildResources() {
             scratch.destroy();
             if (opacityMicromap != null) {
@@ -955,15 +958,17 @@ public final class RtAccel {
         private final int instanceCount;
         private final String label;
         private final boolean update;
+        public final boolean needsBuild;
 
         private PreparedTlas(RtAccel accel, RtBuffer instanceBuffer, RtBuffer scratch, int instanceCount,
-                             String label, boolean update) {
+                             String label, boolean update, boolean needsBuild) {
             this.accel = accel;
             this.instanceBuffer = instanceBuffer;
             this.scratch = scratch;
             this.instanceCount = instanceCount;
             this.label = label;
             this.update = update;
+            this.needsBuild = needsBuild;
         }
     }
 
@@ -986,6 +991,7 @@ public final class RtAccel {
             int capacity;
             int instanceCount = -1;
             List<Instance> baseInstances;
+            final RtTlasState state = new RtTlasState();
             final TrackedGraphicsUse graphicsUse = new TrackedGraphicsUse();
 
             void destroy() {
@@ -1009,13 +1015,25 @@ public final class RtAccel {
     /**
      * Fill the next ring slot's instance buffer and return it as a build-ready TLAS (the slot's AS is
      * built or refitted in place). Changed terrain generations or instance counts require BUILD;
-     * stable generations/counts permit UPDATE. Terrain and dynamic instances occupy contiguous
+     * stable generations/counts permit UPDATE. Unchanged instances and mutable BLAS generations reuse
+     * an existing slot read-only, without a host wait or GPU build. Terrain and dynamic instances occupy contiguous
      * ranges in the instance buffer. The ring owns all resources.
      */
     public static PreparedTlas prepareTlas(RtContext ctx, List<Instance> baseInstances,
-                                           List<Instance> dynamicInstances, TlasRing ring, GraphicsUse graphicsUse) {
+                                           List<Instance> dynamicInstances, long geometryRevision,
+                                           TlasRing ring, GraphicsUse graphicsUse) {
         int baseCount = baseInstances.size();
         int count = Math.addExact(baseCount, dynamicInstances.size());
+        if (!Boolean.getBoolean("caustica.rt.disableTlasReuse")) {
+            for (TlasRing.Slot existing : ring.slots) {
+                if (existing != null && existing.state.matches(baseInstances, dynamicInstances, geometryRevision)) {
+                    // All prior writes precede this trace on the graphics queue. No resource is mutated.
+                    existing.graphicsUse.mark(graphicsUse);
+                    return new PreparedTlas(existing.accel, existing.instanceBuffer, existing.scratch, count,
+                            "reused frame TLAS", false, false);
+                }
+            }
+        }
         TlasRing.Slot slot = ring.slots[ring.cursor];
         // Complete the slot's prior graphics use before rewriting, rebuilding, or resizing it.
         if (slot != null) {
@@ -1037,6 +1055,7 @@ public final class RtAccel {
         boolean update = slot.instanceCount == count && slot.baseInstances == baseInstances;
         slot.instanceCount = count;
         slot.baseInstances = baseInstances;
+        slot.state.remember(baseInstances, dynamicInstances, geometryRevision);
         writeTlasInstances(baseInstances, slot.instanceBuffer.mapped, 0);
         writeTlasInstances(dynamicInstances, slot.instanceBuffer.mapped, baseCount);
         if (count > 0) {
@@ -1044,7 +1063,7 @@ public final class RtAccel {
         }
         slot.graphicsUse.mark(graphicsUse);
         return new PreparedTlas(slot.accel, slot.instanceBuffer, slot.scratch, count,
-                "frame TLAS " + count + " instances", update);
+                "frame TLAS " + count + " instances", update, true);
     }
 
     // Wrap the mapped Vulkan array in LWJGL structs so its generated accessors own the native ABI/bitfields.
@@ -1219,6 +1238,7 @@ public final class RtAccel {
 
     /** Record a labelled TLAS build into the command buffer. */
     public static void recordTlasBuild(RtContext ctx, VkCommandBuffer cmd, PreparedTlas tlas) {
+        if (!tlas.needsBuild) return;
         try (RtDebugLabels.Scope ignored = RtDebugLabels.scope(ctx, cmd, tlas.label + (tlas.update ? " refit" : " build"))) {
             recordTlasBuildRaw(ctx, cmd, tlas);
         }

@@ -21,7 +21,11 @@ float4 main(FragmentInput input) : SV_Target0 {
     ray.TMax = max(distanceToEdge - 0.01, 0.001);
 
     RayQuery<RAY_FLAG_FORCE_OPAQUE | RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH> query;
-    query.TraceRayInline(tlas, RAY_FLAG_NONE, CULL_PRIMARY, ray);
+    query.TraceRayInline(tlas[0], RAY_FLAG_NONE, CULL_PRIMARY, ray);
+    while (query.Proceed()) {
+    }
+    if (query.CommittedStatus() != COMMITTED_NOTHING) discard;
+    query.TraceRayInline(tlas[1], RAY_FLAG_NONE, CULL_PRIMARY, ray);
     while (query.Proceed()) {
     }
     if (query.CommittedStatus() != COMMITTED_NOTHING) discard;

@@ -2,10 +2,13 @@ package dev.comfyfluffy.caustica.rt;
 
 import org.lwjgl.system.MemoryStack;
 import org.lwjgl.vulkan.*;
+import org.lwjgl.util.vma.Vma;
+import org.lwjgl.util.vma.VmaBudget;
 
 /** Driver estimates for this process; the budget also reflects competing system GPU usage. */
 public final class RtMemoryBudget {
-    public record Snapshot(long localUsage, long localBudget, long nonLocalUsage) {}
+    public record Snapshot(long localUsage, long localBudget, long nonLocalUsage,
+                           long rtAllocated, long rtBlocks, long rtAllocations) {}
     private final RtContext ctx;
     private final boolean supported;
 
@@ -25,19 +28,26 @@ public final class RtMemoryBudget {
     }
 
     public Snapshot read() {
-        if (!supported) return new Snapshot(0, 0, 0);
         try (MemoryStack stack = MemoryStack.stackPush()) {
             var budget = VkPhysicalDeviceMemoryBudgetPropertiesEXT.calloc(stack).sType$Default();
-            var props = VkPhysicalDeviceMemoryProperties2.calloc(stack).sType$Default().pNext(budget.address());
+            var props = VkPhysicalDeviceMemoryProperties2.calloc(stack).sType$Default();
+            if (supported) props.pNext(budget.address());
             VK11.vkGetPhysicalDeviceMemoryProperties2(ctx.vk().getPhysicalDevice(), props);
             long localUsage = 0, localBudget = 0, nonLocalUsage = 0;
             var memory = props.memoryProperties();
+            var heaps = VmaBudget.calloc(VK10.VK_MAX_MEMORY_HEAPS, stack);
+            Vma.vmaGetHeapBudgets(ctx.vma(), heaps);
+            long rtAllocated = 0, rtBlocks = 0, rtAllocations = 0;
             for (int i = 0; i < memory.memoryHeapCount(); i++) {
+                var statistics = heaps.get(i).statistics();
+                rtAllocated += statistics.allocationBytes();
+                rtBlocks += statistics.blockBytes();
+                rtAllocations += statistics.allocationCount();
                 if ((memory.memoryHeaps(i).flags() & VK10.VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) != 0) {
                     localUsage += budget.heapUsage(i); localBudget += budget.heapBudget(i);
                 } else nonLocalUsage += budget.heapUsage(i);
             }
-            return new Snapshot(localUsage, localBudget, nonLocalUsage);
+            return new Snapshot(localUsage, localBudget, nonLocalUsage, rtAllocated, rtBlocks, rtAllocations);
         }
     }
 }

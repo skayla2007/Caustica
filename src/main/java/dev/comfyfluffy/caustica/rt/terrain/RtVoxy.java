@@ -38,7 +38,7 @@ public final class RtVoxy {
     public static void frame(RtContext ctx, org.joml.Matrix4fc projectionView, int width, int height) {
         if (!PRESENT) return;
         if (backend == null) {
-            if (VoxyLodApi.VERSION != 3) throw new IllegalStateException("Caustica requires Voxy LOD API 3; install both matching integration jars");
+            if (VoxyLodApi.VERSION != 4) throw new IllegalStateException("Caustica requires Voxy LOD API 4; install both matching integration jars");
             backend = new Backend();
             CausticaMod.LOGGER.info("Voxy LOD API connected; Caustica owns ray-traced LOD rendering");
         }
@@ -72,8 +72,22 @@ public final class RtVoxy {
         RtSectionBuilder.PreparedSection prepared;
         RtGpuExecutor.Build build;
         boolean ready;
+        boolean published;
+        RtAccel.Instance instance;
         long lastNeeded;
+        long buildWorkingBytes;
         Entry(Stamp stamp, LodMesh mesh) { this.stamp = stamp; this.mesh = mesh; }
+        RtAccel.Instance instance(int x, int y, int z, int index) {
+            float dx = mesh.originX() - x, dy = mesh.originY() - y, dz = mesh.originZ() - z;
+            float[] transform = instance == null ? null : instance.transform3x4();
+            if (transform == null || transform[3] != dx || transform[7] != dy || transform[11] != dz)
+                transform = new float[]{1,0,0,dx,0,1,0,dy,0,0,1,dz};
+            long address = prepared.blas().accel.deviceAddress;
+            if (instance == null || instance.transform3x4() != transform || instance.customIndex() != index
+                    || instance.blasDeviceAddress() != address)
+                instance = new RtAccel.Instance(transform, address, index);
+            return instance;
+        }
         void destroy() {
             if (prepared == null) return;
             prepared.blas().accel.destroy();
@@ -103,12 +117,15 @@ public final class RtVoxy {
         private volatile long generation;
         private long epoch = -1, materialEpoch = -1, sourceTable;
         private int textureSlot = -1, originX, originY, originZ;
+        private long atlasView;
         private int reportedMeshes;
         private long frame;
         private static final boolean PROFILE = Boolean.getBoolean("caustica.voxy.profile");
         private long profileAt = System.nanoTime(), profileFrames, providerNs, prepareNs, selectionNs;
         private long dispatchedEmpty, dispatchedGeometry, preparedCount;
         private dev.comfyfluffy.caustica.rt.RtMemoryBudget memoryBudget;
+        private final java.util.concurrent.atomic.AtomicLong buildWorkingBytes = new java.util.concurrent.atomic.AtomicLong();
+        private long buildLimit = RtVoxyBuildBudget.MAX, nextBudgetRead;
         private LodScene sortedScene;
         private List<LodMesh> sortedCandidates = List.of();
         private double sortedX, sortedY, sortedZ;
@@ -135,19 +152,38 @@ public final class RtVoxy {
             LodScene scene = VoxyLodApi.update(pos.x, pos.y, pos.z, projectionView, width, height);
             long afterProvider = System.nanoTime();
             if (scene == null) { clear(ctx); return; }
-            int slot = RtEntityTextures.INSTANCE.slotForView(scene.atlasView());
-            if (slot == 0) throw new IllegalStateException("No bindless texture slot for Voxy LOD atlas");
             long materials = RtMaterialRegistry.INSTANCE.epoch();
+            int slot;
+            if (scene.epoch() == epoch && materials == materialEpoch && textureSlot > 0
+                    && scene.atlasView() != atlasView) {
+                var readers = new RtGpuExecutor.TrackedGraphicsUse();
+                readers.mark(ctx.gpuExecutor().latestGraphicsUse());
+                ctx.gpuExecutor().graphicsUseWaiter().await(readers);
+                RtEntityTextures.INSTANCE.replaceView(textureSlot, atlasView, scene.atlasView());
+                slot = textureSlot;
+            } else slot = RtEntityTextures.INSTANCE.slotForView(scene.atlasView());
+            if (slot == 0) throw new IllegalStateException("No bindless texture slot for Voxy LOD atlas");
+            atlasView = scene.atlasView();
             if (scene.epoch() != epoch || materials != materialEpoch || slot != textureSlot) {
                 clear(ctx);
                 epoch = scene.epoch(); materialEpoch = materials; textureSlot = slot;
             }
             List<Entry> batch = new ArrayList<>();
             boolean readinessChanged = false;
+            long budgetNow = System.nanoTime();
+            if (budgetNow >= nextBudgetRead) {
+                if (memoryBudget == null) memoryBudget = new dev.comfyfluffy.caustica.rt.RtMemoryBudget(ctx);
+                var budget = memoryBudget.read();
+                buildLimit = RtVoxyBuildBudget.limit(budget.localUsage(), budget.localBudget());
+                nextBudgetRead = budgetNow + 500_000_000L;
+            }
             long prepareDeadline = System.nanoTime() + 8_000_000;
             for (int n = 0; n < 512 && System.nanoTime() < prepareDeadline; n++) {
-                CpuCompletion cpu = converted.poll();
+                CpuCompletion cpu = converted.peek();
                 if (cpu == null) break;
+                if (cpu.generation() == generation && cpu.failure() == null && cpu.packed().indices().length != 0
+                        && !RtVoxyBuildBudget.canStart(buildWorkingBytes.get(), RtVoxyBuildBudget.estimate(cpu.packed()), buildLimit)) break;
+                converted.poll();
                 if (cpu.generation() != generation) continue;
                 Entry entry = cpu.entry();
                 if (cpu.failure() != null) throw new IllegalStateException("Voxy triangle conversion failed", cpu.failure());
@@ -160,6 +196,11 @@ public final class RtVoxy {
                 } else {
                     entry.prepared = RtSectionBuilder.prepare(ctx, cpu.packed(), null, true, entry.mesh.key,
                             entry.mesh.originX(), entry.mesh.originY(), entry.mesh.originZ());
+                    var p = entry.prepared;
+                    entry.buildWorkingBytes = p.positions().size + p.indices().size + p.uvs().size
+                            + p.material().size + p.upload().size + p.blas().buildWorkingBytes()
+                            + p.blas().accel.allocatedBytes();
+                    buildWorkingBytes.addAndGet(entry.buildWorkingBytes);
                     batch.add(entry);
                     preparedCount++;
                 }
@@ -252,7 +293,10 @@ public final class RtVoxy {
                 changed = !active.equals(desired);
                 if (changed) {
                     active = List.copyOf(desired);
-                    for (Entry entry : active) ctx.gpuExecutor().markPublished(entry.build);
+                    for (Entry entry : active) if (!entry.published) {
+                        ctx.gpuExecutor().markPublished(entry.build);
+                        entry.published = true;
+                    }
                     if (reportedMeshes == 0 || active.size() >= reportedMeshes + 32) {
                         int[] levels = new int[5];
                         for (Entry entry : active) levels[entry.mesh.level]++;
@@ -295,8 +339,10 @@ public final class RtVoxy {
                 if (now - profileAt > 2_000_000_000L) {
                     if (memoryBudget == null) memoryBudget = new dev.comfyfluffy.caustica.rt.RtMemoryBudget(ctx);
                     var budget = memoryBudget.read();
-                    CausticaMod.LOGGER.info("RT memory budget localUsageMiB={} localBudgetMiB={} nonLocalUsageMiB={}",
-                            budget.localUsage()/1048576, budget.localBudget()/1048576, budget.nonLocalUsage()/1048576);
+                    CausticaMod.LOGGER.info("RT memory budget localUsageMiB={} localBudgetMiB={} nonLocalUsageMiB={} rtAllocatedMiB={} rtBlocksMiB={} rtAllocations={} lodBuildWorkingMiB={} lodBuildLimitMiB={}",
+                            budget.localUsage()/1048576, budget.localBudget()/1048576, budget.nonLocalUsage()/1048576,
+                            budget.rtAllocated()/1048576, budget.rtBlocks()/1048576, budget.rtAllocations(),
+                            buildWorkingBytes.get()/1048576, buildLimit/1048576);
                     long targetQuads = 0, ancestorQuads = 0, residentBytes = 0, blasBytes = 0;
                     int empty = 0, readyTargets = 0;
                     for (LodMesh m : scene.meshes()) {
@@ -369,6 +415,7 @@ public final class RtVoxy {
         }
 
         private void finish(RtContext ctx, long token, Entry entry, RtGpuExecutor.Build build, Throwable failure) {
+            buildWorkingBytes.addAndGet(-entry.buildWorkingBytes);
             synchronized (completed) {
                 if (token != generation) {
                     if (failure == null) ctx.gpuExecutor().retireUnpublished(entry::destroy);
@@ -404,9 +451,7 @@ public final class RtVoxy {
             int offset = terrain.tableCapacity();
             for (int i = 0; i < active.size(); i++) {
                 var entry = active.get(i);
-                list.add(new RtAccel.Instance(new float[]{1,0,0,entry.mesh.originX()-terrain.blockX,
-                        0,1,0,entry.mesh.originY()-terrain.blockY,0,0,1,entry.mesh.originZ()-terrain.blockZ},
-                        entry.prepared.blas().accel.deviceAddress, offset + i));
+                list.add(entry.instance(terrain.blockX, terrain.blockY, terrain.blockZ, offset + i));
             }
             instances = list;
             vanillaRevision = terrain.instanceRevision();

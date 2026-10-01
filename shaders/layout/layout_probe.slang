@@ -15,10 +15,14 @@ struct MaterialHeaderLayoutProbe {
 struct ExposureStateLayoutProbe {
     ExposureState values[2]; // array stride is the complete, tail-padded ExposureState byte size
 };
+struct PackedPathLayoutProbe { PackedPathSegment values[2]; };
+struct CachedHitLayoutProbe { CachedPrimaryHit values[2]; };
 
 [[vk::binding(0, 0)]] StructuredBuffer<WorldPushLayoutProbe, Std430DataLayout> worldPushLayoutProbe;
 [[vk::binding(1, 0)]] StructuredBuffer<MaterialHeaderLayoutProbe, Std430DataLayout> materialHeaderLayoutProbe;
 [[vk::binding(2, 0)]] StructuredBuffer<ExposureStateLayoutProbe, Std430DataLayout> exposureStateLayoutProbe;
+[[vk::binding(3, 0)]] StructuredBuffer<PackedPathLayoutProbe, Std430DataLayout> packedPathLayoutProbe;
+[[vk::binding(4, 0)]] StructuredBuffer<CachedHitLayoutProbe, Std430DataLayout> cachedHitLayoutProbe;
 [[vk::push_constant]] WorldPushConstants pushConstantsLayoutProbe;
 
 [shader("compute")]
@@ -29,7 +33,9 @@ void main(uint3 id : SV_DispatchThreadID) {
         float sink = worldPushLayoutProbe[0].values[0].invViewProj[0][0]
                 + materialHeaderLayoutProbe[0].values[0].params.x
                 + exposureStateLayoutProbe[0].values[0].previous
-                + float(pushConstantsLayoutProbe.frameIndex);
+                + float(pushConstantsLayoutProbe.frameIndex)
+                + float(packedPathLayoutProbe[0].values[0].pathFlags)
+                + float(cachedHitLayoutProbe[0].values[0].flags);
     }
 }
 

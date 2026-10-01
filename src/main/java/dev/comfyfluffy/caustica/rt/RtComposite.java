@@ -75,6 +75,7 @@ import java.nio.ByteBuffer;
 import java.nio.LongBuffer;
 import java.nio.file.Path;
 import java.util.Objects;
+import java.util.List;
 
 /**
  * On-screen composite. Each frame, ray-trace into a render-res storage image (+ guide buffers), use
@@ -104,7 +105,7 @@ public final class RtComposite {
     // Hot addresses/frameIndex avoid unnecessary global-memory dereferences; WorldPushConstantsData is
     // generated from the same Slang module and owns this second ABI as well. debugView is no longer
     // part of it -- no world shader reads it anymore; debug views are a downstream compute pass.
-    private static final long PATH_RECORD_BYTES = 48L;
+    private static final long PATH_RECORD_BYTES = dev.comfyfluffy.caustica.rt.gen.PackedPathSegmentData.BYTE_SIZE;
     private static int debugView() {
         return CausticaConfig.Rt.Composite.DEBUG_VIEW.value();
     }
@@ -299,6 +300,8 @@ public final class RtComposite {
 
     // Persistent TLAS slots wait for prior graphics use before rebuilding or refitting in place.
     private final RtAccel.TlasRing tlasRing = new RtAccel.TlasRing();
+    private final RtAccel.TlasRing dynamicTlasRing = new RtAccel.TlasRing();
+    private long dynamicGeometryRevision;
     private RtGpuTimings gpuTimings;
 
     // This frame's TLAS handle, published after prepareTlas so the world-overlay pass (block outline's
@@ -307,6 +310,7 @@ public final class RtComposite {
     // makes the TLAS build's writes visible without an extra semaphore, matching every other overlay
     // feature's reliance on in-order queue execution for this frame's world content.
     private volatile long currentTlasHandle;
+    private volatile long currentDynamicTlasHandle;
     private RtGpuExecutor.GraphicsUse pendingGraphicsUse;
 
     private RtComposite() {
@@ -316,6 +320,8 @@ public final class RtComposite {
     public long currentTlasHandle() {
         return currentTlasHandle;
     }
+
+    public long currentDynamicTlasHandle() { return currentDynamicTlasHandle; }
 
     private static Identifier[] createMoonIds() {
         MoonPhase[] phases = MoonPhase.values();
@@ -1064,10 +1070,9 @@ public final class RtComposite {
             RtBuffer pushBuf = selectedPushSlot.buffer;
             ByteBuffer push = MemoryUtil.memByteBuffer(pushBuf.mapped, WORLD_PUSH_SIZE);
             frameInvViewProj.set(frameProjection).mul(frameViewRotation).invert();
-            // flags: camera-in-water (so the path tracer starts in the water medium when the eye is
-            // submerged, fixing the air→water first-segment orientation) and animated water normals.
-            // Bit 1 remains unused to avoid conflicting with stale external readers.
+            // Camera medium, animated water normals, and terminal-camera-hit reuse are independent flags.
             int flags = 0;
+            if (!Boolean.getBoolean("caustica.rt.disablePrimaryHitCache")) flags |= 32;
             var level = Minecraft.getInstance().level;
             if (level != null) {
                 cameraBlockPos.set(Mth.floor(camX), Mth.floor(camY), Mth.floor(camZ));
@@ -1167,23 +1172,32 @@ public final class RtComposite {
             // Build the entity BLAS, the TLAS that references it and the terrain BLAS, then the trace.
             // Barriers separate each stage; the graphics-use timeline guards resource reuse.
             if (!fe.blas().isEmpty()) {
+                dynamicGeometryRevision++;
                 try (RtFrameStats.Scope ignored = RtFrameStats.FRAME.stage("entity.blasRecord")) {
                     RtAccel.recordBlasBuilds(ctx, cmd, fe.blas());
                 }
                 VulkanCommandEncoder.memoryBarrier(cmd, stack); // entity BLAS writes visible to the TLAS build
             }
             RtAccel.PreparedTlas frameTlas;
+            RtAccel.PreparedTlas dynamicTlas;
+            boolean separateDynamic = !Boolean.getBoolean("caustica.rt.disableSplitTlas");
             if (gpuTimings != null) gpuTimings.mark(cmd, pushSlot, 1);
             try (RtFrameStats.Scope ignored = RtFrameStats.FRAME.stage("frame.prepareTlas")) {
-                frameTlas = RtAccel.prepareTlas(ctx, fe.baseInstances(), fe.dynamicInstances(), tlasRing,
+                frameTlas = RtAccel.prepareTlas(ctx, fe.baseInstances(), separateDynamic ? List.of() : fe.dynamicInstances(), dynamicGeometryRevision, tlasRing,
                         graphicsUse);
+                dynamicTlas = separateDynamic && !fe.dynamicInstances().isEmpty()
+                        ? RtAccel.prepareTlas(ctx, List.of(), fe.dynamicInstances(), dynamicGeometryRevision,
+                                dynamicTlasRing, graphicsUse) : frameTlas;
             }
-            active.setTlas(frameTlas.accel.handle, graphicsUse, graphicsUseWaiter);
+            active.setTlas(frameTlas.accel.handle, dynamicTlas.accel.handle, graphicsUse, graphicsUseWaiter);
             currentTlasHandle = frameTlas.accel.handle;
+            currentDynamicTlasHandle = dynamicTlas.accel.handle;
             try (RtFrameStats.Scope ignored = RtFrameStats.FRAME.stage("frame.recordTlas")) {
                 RtAccel.recordTlasBuild(ctx, cmd, frameTlas);
+                if (dynamicTlas != frameTlas) RtAccel.recordTlasBuild(ctx, cmd, dynamicTlas);
             }
-            VulkanCommandEncoder.memoryBarrier(cmd, stack); // TLAS build visible to the trace
+            if (frameTlas.needsBuild || dynamicTlas.needsBuild) VulkanCommandEncoder.memoryBarrier(cmd, stack);
+            RtFrameStats.FRAME.count(frameTlas.needsBuild ? "tlasBuilds" : "tlasReuses", 1);
             if (gpuTimings != null) gpuTimings.mark(cmd, pushSlot, 2);
 
             // Push the BDA ring slot's address plus the small hot subset used directly by the shaders.
@@ -1197,7 +1211,7 @@ public final class RtComposite {
                     terrain.lightBufferAddress(), terrain.lightAliasBufferAddress(),
                     terrain.lightLocalAliasBufferAddress(), terrain.lightGridCellBufferAddress(),
                     terrain.lightGridSpanBufferAddress(), continuationQueue.deviceAddress,
-                    (int) frameCounter).write(pushConstants);
+                    (int) frameCounter, dynamicTlas != frameTlas ? 1 : 0).write(pushConstants);
             // Sky LUTs, from the same WorldPush slot the trace is about to read: the sky the LUT holds and
             // the sky the frame shades are built from one set of angles, not two. Recorded here (after the
             // push flush, before the trace) so the miss shader's very first fetch sees this frame's dome.
@@ -1474,6 +1488,7 @@ public final class RtComposite {
         // Teardown runs after the device is idle (CLIENT_STOPPING waits), so the TLAS ring's slots are no
         // longer in flight and can be freed immediately.
         tlasRing.destroy();
+        dynamicTlasRing.destroy();
         if (gpuTimings != null) { gpuTimings.destroy(); gpuTimings = null; }
         if (RtDlssRr.enabled()) {
             RtDlssRr.INSTANCE.destroy();

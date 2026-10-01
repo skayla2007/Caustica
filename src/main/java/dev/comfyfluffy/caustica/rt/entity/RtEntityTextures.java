@@ -175,6 +175,17 @@ public final class RtEntityTextures {
         return slot;
     }
 
+    /** Replace an atlas after its prior GPU readers complete, keeping geometry's slot IDs stable. */
+    public void replaceView(int slot, long oldView, long newView) {
+        if (slot <= 0 || viewSlotCache.getOrDefault(oldView, 0) != slot || newView == 0)
+            throw new IllegalArgumentException("Invalid bindless texture replacement");
+        // Caller completes every prior graphics reader before replacing a live descriptor.
+        viewSlotCache.remove(oldView);
+        viewSlotCache.put(newView, slot);
+        pending.removeIf(p -> p.slot() == slot);
+        pending.add(new Pending(slot, newView));
+    }
+
     /** Write any newly-registered entity textures into the pipeline's bindless set (before the trace). */
     public void uploadPending(RtPipeline pipeline, long sampler) {
         if (pending.isEmpty()) {

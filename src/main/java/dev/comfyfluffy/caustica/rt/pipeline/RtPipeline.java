@@ -146,7 +146,7 @@ public final class RtPipeline {
             VkDescriptorSetLayoutBinding.Buffer binds = VkDescriptorSetLayoutBinding.calloc(
                     WORLD_SET_BINDING_COUNT, stack);
             binds.get(WORLD_TLAS).binding(WORLD_TLAS).descriptorType(VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR)
-                    .descriptorCount(1).stageFlags(VK_SHADER_STAGE_RAYGEN_BIT_KHR);
+                    .descriptorCount(2).stageFlags(VK_SHADER_STAGE_RAYGEN_BIT_KHR);
             binds.get(WORLD_OUTPUT).binding(WORLD_OUTPUT).descriptorType(VK10.VK_DESCRIPTOR_TYPE_STORAGE_IMAGE)
                     .descriptorCount(1).stageFlags(VK_SHADER_STAGE_RAYGEN_BIT_KHR);
             int atlasStages = VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR
@@ -175,7 +175,7 @@ public final class RtPipeline {
             RtDebugLabels.name(ctx, VK10.VK_OBJECT_TYPE_DESCRIPTOR_SET_LAYOUT, dsl, label + " descriptor set layout");
 
             VkDescriptorPoolSize.Buffer poolSizes = VkDescriptorPoolSize.calloc(3, stack);
-            poolSizes.get(0).type(VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR).descriptorCount(RING);
+            poolSizes.get(0).type(VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR).descriptorCount(2 * RING);
             poolSizes.get(1).type(VK10.VK_DESCRIPTOR_TYPE_STORAGE_IMAGE)
                     .descriptorCount(RING * WORLD_SET_STORAGE_IMAGE_COUNT);
             poolSizes.get(2).type(VK10.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER)
@@ -375,18 +375,18 @@ public final class RtPipeline {
     }
 
     /** Bind a new TLAS after the selected descriptor slot's exact prior graphics use completes. */
-    public void setTlas(long tlas, RtGpuExecutor.GraphicsUse graphicsUse,
+    public void setTlas(long tlas, long dynamicTlas, RtGpuExecutor.GraphicsUse graphicsUse,
                         RtGpuExecutor.GraphicsUseWaiter graphicsUseWaiter) {
         currentSet = (currentSet + 1) % RING;
         RtGpuExecutor.TrackedGraphicsUse slotUse = descriptorSetUses[currentSet];
         graphicsUseWaiter.await(slotUse);
         try (MemoryStack stack = MemoryStack.stackPush()) {
             VkWriteDescriptorSetAccelerationStructureKHR asWrite = VkWriteDescriptorSetAccelerationStructureKHR.calloc(stack)
-                    .sType(VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR).pAccelerationStructures(stack.longs(tlas));
+                    .sType(VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR).pAccelerationStructures(stack.longs(tlas, dynamicTlas));
             VkWriteDescriptorSet.Buffer write = VkWriteDescriptorSet.calloc(1, stack);
             write.get(0).sType$Default().pNext(asWrite.address()).dstSet(descriptorSets[currentSet])
                     .dstBinding(WORLD_TLAS)
-                    .descriptorCount(1).descriptorType(VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR);
+                    .descriptorCount(2).descriptorType(VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR);
             VK10.vkUpdateDescriptorSets(ctx.vk(), write, null);
         }
         slotUse.mark(graphicsUse);

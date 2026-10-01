@@ -8,8 +8,10 @@ public float4 voxyTexel(TerrainPrim primitive, float2 uv, float lod) {
     // Keep sampling within the face at every mip; adjacent atlas faces have independent content.
     float margin = min(0.5, exp2(lod) / 32.0);
     float2 local = clamp(frac(uv), float2(margin), float2(1.0 - margin));
-    float2 atlasUv = (tile + (faceTile + local) / float2(3.0, 2.0)) / 256.0;
     int slot = int(primitive.tint.w + 0.5);
+    uint width, height;
+    entityAlbedoTex[NonUniformResourceIndex(slot)].GetDimensions(width, height);
+    float2 atlasUv = (tile * float2(48.0, 32.0) + (faceTile + local) * 16.0) / float2(width, height);
     return entityAlbedoTex[NonUniformResourceIndex(slot)].SampleLevel(atlasUv, lod);
 }
 

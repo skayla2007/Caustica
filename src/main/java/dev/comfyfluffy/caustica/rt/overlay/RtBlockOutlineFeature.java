@@ -143,7 +143,7 @@ final class RtBlockOutlineFeature implements RtOverlayFeature {
         vbo.flush(0L, (long) data.length * Float.BYTES);
 
         viewProj.set(RtComposite.INSTANCE.currentViewProjection());
-        boundSet = accelSet.bind(ctx, tlas, graphicsUse);
+        boundSet = accelSet.bind(ctx, tlas, RtComposite.INSTANCE.currentDynamicTlasHandle(), graphicsUse);
         return true;
     }
 

@@ -539,10 +539,9 @@ public final class RtOverlayPipelines {
 
     /**
      * A ring of descriptor sets each holding one {@code VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR}
-     * binding — for overlay passes that issue an inline {@code rayQueryEXT} occlusion test against the
-     * world TLAS (e.g. block outline). A ring (not a single set, unlike {@link ReadOnlyImageSet}/
-     * {@link SampledImageSet}) is required because the TLAS handle changes most frames ({@code RtAccel
-     * .TlasRing} cycles it every frame even when it doesn't grow) — rewriting a single set's binding while
+     * binding with static and dynamic scenes, for inline {@code rayQueryEXT} occlusion tests.
+     * A ring (unlike {@link ReadOnlyImageSet}/{@link SampledImageSet}) is required because rebuilding
+     * either TLAS changes its handle — rewriting a single set's binding while
      * an earlier frame's command buffer referencing that same set may still be executing on the GPU is the
      * same "descriptor set update while in use" hazard {@code RtPipeline.setTlas} guards against. Exact
      * graphics completion protects both rings; their depths only avoid routine host waits.
@@ -566,7 +565,7 @@ public final class RtOverlayPipelines {
         }
 
         /** Wait for the next ring slot's prior use, write {@code tlas}, and return the set for this frame. */
-        public long bind(RtContext ctx, long tlas, RtGpuExecutor.GraphicsUse graphicsUse) {
+        public long bind(RtContext ctx, long tlas, long dynamicTlas, RtGpuExecutor.GraphicsUse graphicsUse) {
             current = (current + 1) % RING;
             RtGpuExecutor.TrackedGraphicsUse slotUse = uses[current];
             ctx.gpuExecutor().graphicsUseWaiter().await(slotUse);
@@ -574,10 +573,10 @@ public final class RtOverlayPipelines {
             try (MemoryStack stack = MemoryStack.stackPush()) {
                 VkWriteDescriptorSetAccelerationStructureKHR asWrite = VkWriteDescriptorSetAccelerationStructureKHR.calloc(stack)
                         .sType(KHRAccelerationStructure.VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR)
-                        .pAccelerationStructures(stack.longs(tlas));
+                        .pAccelerationStructures(stack.longs(tlas, dynamicTlas));
                 VkWriteDescriptorSet.Buffer write = VkWriteDescriptorSet.calloc(1, stack);
                 write.get(0).sType$Default().pNext(asWrite.address()).dstSet(set).dstBinding(OVERLAY_TLAS)
-                        .descriptorCount(1).descriptorType(KHRAccelerationStructure.VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR);
+                        .descriptorCount(2).descriptorType(KHRAccelerationStructure.VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR);
                 VK10.vkUpdateDescriptorSets(ctx.vk(), write, null);
             }
             slotUse.mark(graphicsUse);
@@ -596,7 +595,7 @@ public final class RtOverlayPipelines {
             LongBuffer p = stack.mallocLong(1);
             VkDescriptorSetLayoutBinding.Buffer binds = VkDescriptorSetLayoutBinding.calloc(1, stack);
             binds.get(0).binding(OVERLAY_TLAS).descriptorType(KHRAccelerationStructure.VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR)
-                    .descriptorCount(1).stageFlags(stageFlags);
+                    .descriptorCount(2).stageFlags(stageFlags);
             VkDescriptorSetLayoutCreateInfo dslci = VkDescriptorSetLayoutCreateInfo.calloc(stack).sType$Default().pBindings(binds);
             check(VK10.vkCreateDescriptorSetLayout(vk, dslci, null, p), "vkCreateDescriptorSetLayout(" + label + ")");
             long dsl = p.get(0);
@@ -604,7 +603,7 @@ public final class RtOverlayPipelines {
 
             int ring = AccelStructureSet.RING;
             VkDescriptorPoolSize.Buffer poolSizes = VkDescriptorPoolSize.calloc(1, stack);
-            poolSizes.get(0).type(KHRAccelerationStructure.VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR).descriptorCount(ring);
+            poolSizes.get(0).type(KHRAccelerationStructure.VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR).descriptorCount(2 * ring);
             VkDescriptorPoolCreateInfo dpci = VkDescriptorPoolCreateInfo.calloc(stack).sType$Default().maxSets(ring).pPoolSizes(poolSizes);
             check(VK10.vkCreateDescriptorPool(vk, dpci, null, p), "vkCreateDescriptorPool(" + label + ")");
             long pool = p.get(0);

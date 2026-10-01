@@ -60,9 +60,18 @@ public void traceRadiance(uint cullMask, float3 ro, float tmin, float3 rd, float
                     bool showCelestial, float rayConeWidth, float rayConeSpread) {
     payload = makeRadiancePayload(showCelestial ? PAYLOAD_SHOW_CELESTIAL : 0u,
             packHalf2(float2(rayConeWidth, rayConeSpread)));
-    TraceRay(topLevelAS, RAY_FLAG_NONE, cullMask,
+    TraceRay(topLevelAS[0], RAY_FLAG_NONE, cullMask,
             SBT_RADIANCE, SBT_STRIDE_BUCKET, MISS_RADIANCE,
             makeRay(ro, tmin, rd, tmax), payload);
+    if (pc.dynamicScene != 0u) {
+        Payload dynamicHit = makeRadiancePayload(showCelestial ? PAYLOAD_SHOW_CELESTIAL : 0u,
+                packHalf2(float2(rayConeWidth, rayConeSpread)));
+        float nearest = payload.hitT >= 0.0 ? payload.hitT : tmax;
+        TraceRay(topLevelAS[1], RAY_FLAG_NONE, cullMask,
+                SBT_RADIANCE, SBT_STRIDE_BUCKET, MISS_GUIDE,
+                makeRay(ro, tmin, rd, nearest), dynamicHit);
+        if (dynamicHit.hitT >= 0.0) payload = dynamicHit;
+    }
 }
 
 // Auxiliary RR probes deliberately use ordinary TraceRay. They are one-off, incoherent rays whose
@@ -72,8 +81,15 @@ public void traceRadiance(uint cullMask, float3 ro, float tmin, float3 rd, float
 public void traceGuide(uint cullMask, float3 ro, float tmin, float3 rd, float tmax,
                 float rayConeWidth, float rayConeSpread) {
     payload = makeRadiancePayload(0u, packHalf2(float2(rayConeWidth, rayConeSpread)));
-    TraceRay(topLevelAS, RAY_FLAG_NONE, cullMask, SBT_RADIANCE, SBT_STRIDE_BUCKET,
+    TraceRay(topLevelAS[0], RAY_FLAG_NONE, cullMask, SBT_RADIANCE, SBT_STRIDE_BUCKET,
             MISS_GUIDE, makeRay(ro, tmin, rd, tmax), payload);
+    if (pc.dynamicScene != 0u) {
+        Payload dynamicHit = makeRadiancePayload(0u, packHalf2(float2(rayConeWidth, rayConeSpread)));
+        float nearest = payload.hitT >= 0.0 ? payload.hitT : tmax;
+        TraceRay(topLevelAS[1], RAY_FLAG_NONE, cullMask, SBT_RADIANCE, SBT_STRIDE_BUCKET,
+                MISS_GUIDE, makeRay(ro, tmin, rd, nearest), dynamicHit);
+        if (dynamicHit.hitT >= 0.0) payload = dynamicHit;
+    }
 }
 
 public Payload makeShadowPayload() {
@@ -104,10 +120,18 @@ public VisibilityResult visibility(float3 origin, float3 dir, float tmax) {
     // and water tint that transmittance and pass through. Solid blocks terminate traversal. There is no
     // closest shader worth executing. The lightweight guide miss clears the flags sentinel so this path
     // needs only ordinary TraceRay and no invocation-reorder capability.
-    TraceRay(topLevelAS,
+    TraceRay(topLevelAS[0],
             RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_SKIP_CLOSEST_HIT_SHADER,
             CULL_SECONDARY, SBT_SHADOW, SBT_STRIDE_BUCKET, MISS_GUIDE,
             makeRay(origin, RAY_TMIN, dir, tmax), shadowPayload);
+    if (pc.dynamicScene != 0u && shadowPayload.flags == 0u) {
+        // Preserve attenuation and the nearest water crossing from the terrain traversal.
+        shadowPayload.flags = 1u;
+        TraceRay(topLevelAS[1],
+                RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_SKIP_CLOSEST_HIT_SHADER,
+                CULL_SECONDARY, SBT_SHADOW, SBT_STRIDE_BUCKET, MISS_GUIDE,
+                makeRay(origin, RAY_TMIN, dir, tmax), shadowPayload);
+    }
     VisibilityResult result;
     result.transmittance = shadowPayload.flags == 0u
             ? unpackAlbedo(shadowPayload) : float3(0.0, 0.0, 0.0);

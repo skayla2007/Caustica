@@ -34,10 +34,14 @@ import bindings;
 
 // Atmospheric transmittance LUT (RtSkyLut), also bound to world.rmiss at the same binding: raygen reads it
 // to colour the NEE sun/moonlight, the miss shader reads it to tint the visible discs and stars.
-public float3 tracePath(PathSegment seg, uint2 pix, uint sampleIndex) {
+public float3 tracePath(PathSegment seg, CachedPrimaryHit firstHit, uint2 pix, uint2 dimensions, uint sampleIndex) {
     float3 L = float3(0.0, 0.0, 0.0);
     float3 ro = seg.ro;
     float3 rd = seg.rd;
+    if (seg.cachedHit) {
+        float2 unusedNdc;
+        cameraRay(pix, dimensions, ro, rd, unusedNdc);
+    }
     float3 throughput = seg.throughput;
     // Pass A is fixed at one sample per pixel. Decorrelate each Pass B resample here so configured SPP
     // produces independent lighting/BSDF paths from the shared terminal continuation.
@@ -78,6 +82,9 @@ public float3 tracePath(PathSegment seg, uint2 pix, uint sampleIndex) {
         // closest-hit for dielectric handling. Geometry is double-sided; the chit flips the normal.
         // Primary (bounce 0) is the camera ray (CULL_PRIMARY): sees particles but not the first-person
         // player. Bounce rays are secondary (CULL_SECONDARY): exclude particles, include the player.
+        if (seg.cachedHit && bounce == seg.bounce) {
+            payload = cachedPayload(firstHit);
+        } else {
 #ifdef CAUSTICA_ENABLE_EXT_SER
         // SER lifetime phase: keep paths that are not roulette-eligible, paths that may terminate via
         // roulette, and paths guaranteed to end at the bounce cap in separate coherence groups.
@@ -88,6 +95,7 @@ public float3 tracePath(PathSegment seg, uint2 pix, uint sampleIndex) {
         traceRadiance(bounce == 0 ? CULL_PRIMARY : CULL_SECONDARY, ro, 0.0, rd, 10000.0,
                       showCelestial, rayConeWidth, rayConeSpread);
 #endif
+        }
 
         if (payload.hitT < 0.0) {
             // A ray still in water should leave through a water interface. A miss instead means the
@@ -416,8 +424,11 @@ void main() {
     for (uint leaf = 0u; leaf < MAX_PATH_SEGMENTS; ++leaf) {
         PackedPathSegment packed = queue[recordIndex];
         PathSegment segment = unpackPathSegment(packed);
+        CachedPrimaryHit firstHit = {};
+        if (segment.cachedHit) firstHit = ConstPtr<CachedPrimaryHit>(pc.pathQueueAddr
+                + uint64_t(pixelIndex + dimensions.x * dimensions.y) * 48u)[0];
         for (uint s = 0u; s < spp; ++s) {
-            frameRadiance += tracePath(segment, uint2(pix), s + leaf * spp);
+            frameRadiance += tracePath(segment, firstHit, uint2(pix), dimensions, s + leaf * spp);
         }
         if (packed.nextRecord == PATH_NO_NEXT) {
             break;

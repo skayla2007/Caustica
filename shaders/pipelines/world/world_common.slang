@@ -28,6 +28,7 @@ public struct WorldPushConstants {
     public uint64_t lightGridSpanAddr;   // packed weighted section spans referenced by cell headers
     public uint64_t pathQueueAddr;       // packed primary -> indirect continuation records
     public uint frameIndex;
+    public uint dynamicScene;           // nonzero when AS slot 1 contains the separate entity scene
 };
 
 // Minimal push block for the compute passes that only need to dereference the frame's WorldPush: the sky
@@ -53,7 +54,7 @@ public struct WorldPush {
     public float3   camDelta;
     public uint     spp;
     public float2   jitter;
-    public uint     flags;            // bit0 submerged, bit4 waves
+    public uint     flags;            // bit0 submerged, bit4 waves, bit5 reuse terminal camera hit
     public uint     maxBounces;
     // ---- Sky state. Only what the CPU alone can know: Minecraft's four eased celestial angles (the
     // 26.2 timeline drives them through a cubic-bezier ease and a datapack may replace the track, so
@@ -261,6 +262,36 @@ public struct Section {
     public uint64_t primAddr;
     public uint64_t uvAddr;
     public uint triBase[4]; // fixed bucket order: solid/cutout/translucent/water
+};
+
+// Both records have a reflected 48-byte stride. A terminal camera hit occupies its otherwise unused
+// dielectric-branch slot; split continuations never carry a cached-hit flag.
+public struct PackedPathSegment {
+    public float3 ro;
+    public uint rd;
+    public uint throughput;
+    public uint currentExtinction;
+    public uint outerExtinction;
+    public uint mediumIors;
+    public uint rayCone;
+    public uint seed;
+    public uint pathFlags;
+    public uint nextRecord;
+};
+
+public struct CachedPrimaryHit {
+    public uint surface0;
+    public uint surface1;
+    public uint surface2;
+    public uint hitT;
+    public uint f0xy;
+    public uint f0z;
+    public uint flags;
+    public uint roughMetal;
+    public uint emissionSss;
+    public uint iorTransmission;
+    public uint rayCone;
+    public uint reserved;
 };
 
 public TerrainPrim terrainPrim(Section section, uint triangle) {

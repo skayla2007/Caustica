@@ -310,6 +310,15 @@ abstract class GenerateShaderRecords extends DefaultTask {
         new File(packageDir, "ExposureStateData.java").setText(
                 generateJava(exposureStateType, exposureStateByteSize, "ExposureStateData", true), "UTF-8")
 
+        [["packedPathLayoutProbe", "PackedPathSegment", "PackedPathSegmentData"],
+         ["cachedHitLayoutProbe", "CachedPrimaryHit", "CachedPrimaryHitData"]].each { probeName, structName, className ->
+            def array = reflection.parameters.find { it.name == probeName }?.type?.resultType?.fields?.find { it.name == "values" }
+            if (array?.type?.elementType?.name != structName || array.type.uniformStride != 48)
+                throw new GradleException("${structName} must occupy exactly one 48-byte path slot")
+            new File(packageDir, "${className}.java").setText(
+                    generateJava(array.type.elementType as Map, 48, className), "UTF-8")
+        }
+
         PUSH_CONSTANT_PROBES.each { probeName, structName, className ->
             Map type = extractPushConstantType(reflection, probeName, structName)
             int byteSize = extractPushConstantByteSize(reflection, probeName)

@@ -5,7 +5,7 @@ import world_common;
 
 [[vk::push_constant]] public WorldPushConstants pc;
 
-[[vk::binding(0, 0)]] public RaytracingAccelerationStructure topLevelAS;
+[[vk::binding(0, 0)]] public RaytracingAccelerationStructure topLevelAS[2];
 [[vk::binding(1, 0)]] [format("rgba16f")] public RWTexture2D<float4> outImage;
 
 [[vk::binding(3, 0)]] [format("rgba16f")] public RWTexture2D<float4> gNormal;

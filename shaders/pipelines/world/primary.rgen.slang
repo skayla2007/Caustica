@@ -47,6 +47,10 @@ public PathSegment tracePrimary(PathSegment seg,
                       showCelestial, rayConeWidth, rayConeSpread);
 
         if (payload.hitT < 0.0) {
+            if (bounce == 0 && (worldPush.flags & 32u) != 0u) {
+                DevicePtr<CachedPrimaryHit>(pc.pathQueueAddr + uint64_t(splitRecord) * 48u)[0] = cacheHit(payload);
+                terminal.cachedHit = true;
+            }
             if (bounce == 0) {
                 gv_normal = float3(0.0, 0.0, 0.0);
                 gv_albedo = SKY_DIFF_ALBEDO;
@@ -93,11 +97,15 @@ public PathSegment tracePrimary(PathSegment seg,
                 }
             }
 
+            if (bounce == 0 && (worldPush.flags & 32u) != 0u) {
+                DevicePtr<CachedPrimaryHit>(pc.pathQueueAddr + uint64_t(splitRecord) * 48u)[0] = cacheHit(payload);
+                terminal.cachedHit = true;
+            }
             return terminal;
         }
 
         // This hit is consumed in pass A, so carry its travelled-medium absorption and cone growth into
-        // the record for the next trace. The terminal hit above is deliberately not consumed here.
+        // the record for the next trace. Pass B owns the terminal hit's absorption and cone growth.
         if (any(medium.current.extinction > 0.0)) {
             throughput *= exp(-medium.current.extinction * payload.hitT);
         }
@@ -221,14 +229,9 @@ void main() {
     uint2 dimensions = DispatchRaysDimensions().xy;
     int2 pix = int2(dispatchIndex);
     float2 size = float2(dimensions);
-    float2 uv = (float2(pix) + 0.5) / size;
-    float2 jndc = (uv + worldPush.jitter / size) * 2.0 - 1.0;
-    float4 nearH = mul(worldPush.invViewProj, float4(jndc.x, jndc.y, 1.0, 1.0));
-    float4 farH = mul(worldPush.invViewProj, float4(jndc.x, jndc.y, 0.0, 1.0));
-    float3 nearP = nearH.xyz / nearH.w;
-    float3 farP = farH.xyz / farH.w;
-    float3 origin = nearP + worldPush.camOffset;
-    float3 dir = normalize(farP - nearP);
+    float2 jndc;
+    float3 origin, dir;
+    cameraRay(dispatchIndex, dimensions, origin, dir, jndc);
     float rayConeSpread = primaryRayConeSpread(jndc, size, dir);
     uint seed = (dispatchIndex.x * 1973u + dispatchIndex.y * 9277u + 26699u)
             ^ (worldPush.frameIndex * 2654435761u);

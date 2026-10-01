@@ -2,14 +2,8 @@
 // the primary pass writes and the indirect pass reads. Depends on medium.
 
 
-// Everything needed to resume tracing from a point in the scene. The path tracer takes one of these and
-// may hand back another, which is how a dielectric's two Fresnel continuations are traced without
-// instantiating the path tracer twice: the second branch is DATA, not a second inlined copy. `throughput`
-// already carries the branch weight, so segments are simply summed.
-//
-// This is deliberately shaped like a record that could live in a buffer rather than a register: the
-// planned split into a primary/guide pass and an indirect pass hands continuations between dispatches,
-// and this is the payload it would write.
+// Pass A queues up to two weighted Fresnel continuations; Pass B resumes and sums them.
+// A terminal camera hit can reuse the otherwise empty second slot for its surface payload.
 
 import world_common;
 import world_core;
@@ -25,6 +19,7 @@ public struct PathSegment {
     public uint seed;
     public int bounce;          // interfaces already consumed, so RR start and the bounce cap stay global
     public bool showCelestial;
+    public bool cachedHit;
 };
 
 public PathSegment makePathSegment(float3 ro, float3 rd, float3 throughput, MediumStack medium,
@@ -40,23 +35,56 @@ public PathSegment makePathSegment(float3 ro, float3 rd, float3 throughput, Medi
     s.seed = seed;
     s.bounce = bounce;
     s.showCelestial = showCelestial;
+    s.cachedHit = false;
     return s;
 }
-// field is a uint, so Std430DataLayout gives this an exact 48-byte stride.
-public struct PackedPathSegment {
-    public float3 ro;
-    public uint rd;
-    public uint throughput;
-    public uint currentExtinction;
-    public uint outerExtinction;
-    public uint mediumIors;
-    public uint rayCone;
-    public uint seed;
-    public uint pathFlags;
-    public uint nextRecord;
-};
-
 public static const uint PATH_NO_NEXT = 0xffffffffu;
+public static const uint PATH_CACHED_HIT = 1u << 11u;
+
+public CachedPrimaryHit cacheHit(Payload p) {
+    CachedPrimaryHit hit;
+    hit.surface0 = p.surface0;
+    hit.surface1 = p.surface1;
+    hit.surface2 = p.surface2;
+    hit.hitT = asuint(p.hitT);
+    hit.f0xy = packHalf2(float2(p.f0.xy));
+    hit.f0z = packHalf2(float2(p.f0.z, 0.0));
+    hit.flags = p.flags;
+    hit.roughMetal = p.roughMetal;
+    hit.emissionSss = p.emissionSss;
+    hit.iorTransmission = p.iorTransmission;
+    hit.rayCone = p.rayCone;
+    hit.reserved = 0u;
+    return hit;
+}
+
+public Payload cachedPayload(CachedPrimaryHit hit) {
+    Payload p;
+    p.surface0 = hit.surface0;
+    p.surface1 = hit.surface1;
+    p.surface2 = hit.surface2;
+    p.hitT = asfloat(hit.hitT);
+    p.motionPrev = half3(0.0h);
+    p.f0 = half3(float3(unpackHalf2(hit.f0xy), unpackHalf2(hit.f0z).x));
+    p.flags = hit.flags;
+    p.roughMetal = hit.roughMetal;
+    p.emissionSss = hit.emissionSss;
+    p.iorTransmission = hit.iorTransmission;
+    p.rayCone = hit.rayCone;
+    return p;
+}
+
+public void cameraRay(uint2 pixel, uint2 dimensions, out float3 origin, out float3 direction, out float2 jndc) {
+    float2 size = float2(dimensions);
+    float2 uv = (float2(pixel) + 0.5) / size;
+    jndc = (uv + worldPush.jitter / size) * 2.0 - 1.0;
+    float4 nearH = mul(worldPush.invViewProj, float4(jndc.x, jndc.y, 1.0, 1.0));
+    float4 farH = mul(worldPush.invViewProj, float4(jndc.x, jndc.y, 0.0, 1.0));
+    float3 nearP = nearH.xyz / nearH.w;
+    float3 farP = farH.xyz / farH.w;
+    origin = nearP + worldPush.camOffset;
+    direction = normalize(farP - nearP);
+}
 
 public float2 octEncode(float3 direction) {
     float3 n = direction / max(abs(direction.x) + abs(direction.y) + abs(direction.z), 1.0e-20);
@@ -120,6 +148,7 @@ public PackedPathSegment packPathSegment(PathSegment seg, uint nextRecord) {
             | (seg.showCelestial ? 1u << 8u : 0u)
             | (seg.medium.current.water ? 1u << 9u : 0u)
             | (seg.medium.outer.water ? 1u << 10u : 0u);
+    if (seg.cachedHit) p.pathFlags |= PATH_CACHED_HIT;
     p.nextRecord = nextRecord;
     return p;
 }
@@ -138,11 +167,9 @@ public PathSegment unpackPathSegment(PackedPathSegment p) {
     medium.current = current;
     medium.outer = outer;
     float2 cone = unpackHalf2(p.rayCone);
-    return makePathSegment(p.ro, octDecode(unpackUnorm16x2(p.rd)),
+    PathSegment seg = makePathSegment(p.ro, octDecode(unpackUnorm16x2(p.rd)),
             unpackRgb9e5(p.throughput), medium, cone.x, cone.y, p.seed,
             int(p.pathFlags & 15u), (p.pathFlags & (1u << 8u)) != 0u);
+    seg.cachedHit = (p.pathFlags & PATH_CACHED_HIT) != 0u;
+    return seg;
 }
-
-// Walk only the visually-primary dielectric chain. The terminal non-dielectric/miss trace is repeated
-// by the indirect pass, so the returned record describes the state immediately BEFORE that trace.
-// This keeps closest-hit payload data out of the queue and, critically, writes the record before any

@@ -23,9 +23,17 @@ public void traceRadianceReordered(uint cullMask, float3 ro, float tmin, float3 
     uint flags = showCelestial ? PAYLOAD_SHOW_CELESTIAL : 0u;
     uint rayCone = packHalf2(float2(rayConeWidth, rayConeSpread));
     Payload tracePayload = makeRadiancePayload(flags, rayCone);
-    HitObject hObj = HitObject::TraceRay(topLevelAS, RAY_FLAG_NONE, cullMask,
+    HitObject hObj = HitObject::TraceRay(topLevelAS[0], RAY_FLAG_NONE, cullMask,
             SBT_RADIANCE, SBT_STRIDE_BUCKET, MISS_RADIANCE,
             makeRay(ro, tmin, rd, tmax), tracePayload);
+    bool dynamicHit = false;
+    if (pc.dynamicScene != 0u) {
+        float nearest = hObj.IsHit() ? hObj.GetRayDesc().TMax : tmax;
+        HitObject entity = HitObject::TraceRay(topLevelAS[1], RAY_FLAG_NONE, cullMask,
+                SBT_RADIANCE, SBT_STRIDE_BUCKET, MISS_RADIANCE,
+                makeRay(ro, tmin, rd, nearest), tracePayload);
+        if (entity.IsHit()) { hObj = entity; dynamicHit = true; }
+    }
     // The hit object groups shader IDs first. Its SBT index then supplies the two-bit geometry/material
     // bucket ({solid, cutout, translucent, water}); terrain and entity record ranges are both multiples
     // of TERRAIN_BUCKETS, so the low bits have the same meaning. The high two bits describe path lifetime:
@@ -34,5 +42,6 @@ public void traceRadianceReordered(uint cullMask, float3 ro, float tmin, float3 
     uint coherenceHint = (pathPhaseHint << 2u) | materialHint;
     ReorderThread(hObj, coherenceHint, 4u);
     payload = makeRadiancePayload(flags, rayCone);
-    HitObject::Invoke(topLevelAS, hObj, payload);
+    if (dynamicHit) HitObject::Invoke(topLevelAS[1], hObj, payload);
+    else HitObject::Invoke(topLevelAS[0], hObj, payload);
 }

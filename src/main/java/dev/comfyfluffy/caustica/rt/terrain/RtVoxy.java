@@ -38,7 +38,7 @@ public final class RtVoxy {
     public static void frame(RtContext ctx, org.joml.Matrix4fc projectionView, int width, int height) {
         if (!PRESENT) return;
         if (backend == null) {
-            if (VoxyLodApi.VERSION != 4) throw new IllegalStateException("Caustica requires Voxy LOD API 4; install both matching integration jars");
+            if (VoxyLodApi.VERSION != 5) throw new IllegalStateException("Caustica requires Voxy LOD API 5; install both matching integration jars");
             backend = new Backend();
             CausticaMod.LOGGER.info("Voxy LOD API connected; Caustica owns ray-traced LOD rendering");
         }

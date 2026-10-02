@@ -1198,6 +1198,7 @@ public final class RtComposite {
             }
             if (frameTlas.needsBuild || dynamicTlas.needsBuild) VulkanCommandEncoder.memoryBarrier(cmd, stack);
             RtFrameStats.FRAME.count(frameTlas.needsBuild ? "tlasBuilds" : "tlasReuses", 1);
+            if (frameTlas.needsBuild) RtFrameStats.FRAME.count(frameTlas.update ? "tlasUpdates" : "tlasRebuilds", 1);
             if (gpuTimings != null) gpuTimings.mark(cmd, pushSlot, 2);
 
             // Push the BDA ring slot's address plus the small hot subset used directly by the shaders.

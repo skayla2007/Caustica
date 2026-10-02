@@ -957,7 +957,7 @@ public final class RtAccel {
         private final RtBuffer scratch;
         private final int instanceCount;
         private final String label;
-        private final boolean update;
+        public final boolean update;
         public final boolean needsBuild;
 
         private PreparedTlas(RtAccel accel, RtBuffer instanceBuffer, RtBuffer scratch, int instanceCount,
@@ -992,6 +992,9 @@ public final class RtAccel {
             int instanceCount = -1;
             List<Instance> baseInstances;
             final RtTlasState state = new RtTlasState();
+            List<Instance> layout = List.of();
+            boolean padded;
+            int updates;
             final TrackedGraphicsUse graphicsUse = new TrackedGraphicsUse();
 
             void destroy() {
@@ -1014,8 +1017,9 @@ public final class RtAccel {
 
     /**
      * Fill the next ring slot's instance buffer and return it as a build-ready TLAS (the slot's AS is
-     * built or refitted in place). Changed terrain generations or instance counts require BUILD;
-     * stable generations/counts permit UPDATE. Unchanged instances and mutable BLAS generations reuse
+     * built or refitted in place). Large static selections keep live, masked padding and stable spatial
+     * slots so small selection changes permit UPDATE at a fixed primitive count. Large changes and
+     * periodic quality refreshes require BUILD. Unchanged instances and mutable BLAS generations reuse
      * an existing slot read-only, without a host wait or GPU build. Terrain and dynamic instances occupy contiguous
      * ranges in the instance buffer. The ring owns all resources.
      */
@@ -1050,19 +1054,32 @@ public final class RtAccel {
         }
         ring.cursor = (ring.cursor + 1) % TlasRing.RING;
 
-        // Terrain instances reference immutable BLAS. A different list denotes a new terrain/rebase
-        // generation; rebuild its hierarchy, while same-count dynamic motion can refit the prior slot.
-        boolean update = slot.instanceCount == count && slot.baseInstances == baseInstances;
-        slot.instanceCount = count;
+        // Instance definitions may change during UPDATE, but primitive count and inactive state may not.
+        boolean padded = dynamicInstances.isEmpty() && baseCount >= 4096
+                && !Boolean.getBoolean("caustica.rt.disableTerrainTlasRefit");
+        int buildCount = padded ? slot.capacity : count;
+        boolean update;
+        if (padded) {
+            var plan = RtTlasLayout.plan(baseInstances, slot.layout, slot.capacity);
+            update = RtTlasLayout.shouldRefit(slot.padded, slot.instanceCount, slot.capacity, plan.added(), slot.updates);
+            slot.layout = plan.instances();
+            writeTlasInstances(slot.layout, slot.instanceBuffer.mapped, 0);
+        } else {
+            update = !slot.padded && slot.instanceCount == count && slot.baseInstances == baseInstances;
+            slot.layout = List.of();
+            writeTlasInstances(baseInstances, slot.instanceBuffer.mapped, 0);
+            writeTlasInstances(dynamicInstances, slot.instanceBuffer.mapped, baseCount);
+        }
+        slot.padded = padded;
+        slot.updates = update ? slot.updates + 1 : 0;
+        slot.instanceCount = buildCount;
         slot.baseInstances = baseInstances;
         slot.state.remember(baseInstances, dynamicInstances, geometryRevision);
-        writeTlasInstances(baseInstances, slot.instanceBuffer.mapped, 0);
-        writeTlasInstances(dynamicInstances, slot.instanceBuffer.mapped, baseCount);
-        if (count > 0) {
-            slot.instanceBuffer.flush(0L, (long) count * VkAccelerationStructureInstanceKHR.SIZEOF);
+        if (buildCount > 0) {
+            slot.instanceBuffer.flush(0L, (long) buildCount * VkAccelerationStructureInstanceKHR.SIZEOF);
         }
         slot.graphicsUse.mark(graphicsUse);
-        return new PreparedTlas(slot.accel, slot.instanceBuffer, slot.scratch, count,
+        return new PreparedTlas(slot.accel, slot.instanceBuffer, slot.scratch, buildCount,
                 "frame TLAS " + count + " instances", update, true);
     }
 

@@ -72,10 +72,12 @@ public final class RtVoxy {
         RtSectionBuilder.PreparedSection prepared;
         RtGpuExecutor.Build build;
         boolean ready;
+        boolean live = true;
         boolean published;
         RtAccel.Instance instance;
         long lastNeeded;
         long buildWorkingBytes;
+        long buildTriangles;
         Entry(Stamp stamp, LodMesh mesh) { this.stamp = stamp; this.mesh = mesh; }
         RtAccel.Instance instance(int x, int y, int z, int index) {
             float dx = mesh.originX() - x, dy = mesh.originY() - y, dz = mesh.originZ() - z;
@@ -99,6 +101,9 @@ public final class RtVoxy {
     private record Request(Stamp stamp, LodMesh mesh, long covered) {}
     private record Prioritized(LodMesh mesh, double distance) {}
     private record CpuCompletion(long generation, Entry entry, RtTerrainMesher.PackedSection packed, Throwable failure) {}
+    private record SelectionResult(long generation, long retireRevision, LodHierarchy.Selection hierarchy,
+                                   List<LodMesh> meshes, List<Entry> entries, List<Entry> drawable, List<Entry> unpublished,
+                                   List<Entry> departing, Long2ObjectOpenHashMap<Entry> published, LodHierarchy.Coverage coverage) {}
 
     private static final class Backend {
         private final Map<Stamp, Entry> cache = new HashMap<>();
@@ -119,28 +124,44 @@ public final class RtVoxy {
         private int textureSlot = -1, originX, originY, originZ;
         private long atlasView;
         private int reportedMeshes;
-        private long frame;
         private static final boolean PROFILE = Boolean.getBoolean("caustica.voxy.profile");
         private long profileAt = System.nanoTime(), profileFrames, providerNs, prepareNs, selectionNs;
         private long dispatchedEmpty, dispatchedGeometry, preparedCount;
         private dev.comfyfluffy.caustica.rt.RtMemoryBudget memoryBudget;
         private final java.util.concurrent.atomic.AtomicLong buildWorkingBytes = new java.util.concurrent.atomic.AtomicLong();
+        private final java.util.concurrent.atomic.AtomicLong buildTriangles = new java.util.concurrent.atomic.AtomicLong();
+        private final RtVoxyLoadBudget loadBudget = new RtVoxyLoadBudget();
+        private long lastFrameTime, triangleLimit = RtVoxyLoadBudget.MAX_TRIANGLES;
+        private long warmCacheLimit, nextPublication;
+        private final List<Entry> warmEntries = new ArrayList<>();
+        private long nextWarmTrim;
+        private long retireRevision, nextEmptyTrim;
+        private final ArrayDeque<Entry> emptyEntries = new ArrayDeque<>();
+        private boolean publicationDirty;
+        private List<LodMesh> publishedSelection = List.of();
+        private final ExecutorService selector = Executors.newSingleThreadExecutor(task -> {
+            var thread = new Thread(task, "Caustica Voxy ready selection"); thread.setDaemon(true); return thread;
+        });
+        private java.util.concurrent.CompletableFuture<SelectionResult> selecting;
+        private SelectionResult readySelection;
+        private LodHierarchy.Selection coveredSelection;
+        private LodHierarchy.Coverage publishedCoverage;
+        private Long2ObjectOpenHashMap<Entry> publishedEntries = new Long2ObjectOpenHashMap<>();
+        private long staleCpuJobs, publications, plannedRequests;
         private long buildLimit = RtVoxyBuildBudget.MAX, nextBudgetRead;
-        private LodScene sortedScene;
-        private List<LodMesh> sortedCandidates = List.of();
-        private double sortedX, sortedY, sortedZ;
         private LodScene indexedScene;
         private LodHierarchy.Selection hierarchy;
         private final RtVoxySelectionGate selectionGate = new RtVoxySelectionGate();
         private long vanillaRevision = -1;
-        private final Long2ObjectOpenHashMap<Entry> resolved = new Long2ObjectOpenHashMap<>();
+        private Long2ObjectOpenHashMap<Entry> resolved = new Long2ObjectOpenHashMap<>();
         private final Long2ObjectOpenHashMap<Stamp> plannedStamps = new Long2ObjectOpenHashMap<>();
         private final Set<Stamp> needed = new HashSet<>();
         private final ArrayDeque<Request> workQueue = new ArrayDeque<>();
 
         void frame(RtContext ctx, org.joml.Matrix4fc projectionView, int width, int height) {
             long profileStart = System.nanoTime();
-            frame++;
+            if (lastFrameTime != 0) triangleLimit = loadBudget.update(profileStart - lastFrameTime);
+            lastFrameTime = profileStart;
             var mc = Minecraft.getInstance();
             RtTerrain terrain = RtTerrain.currentOrNull();
             if (mc.level == null || mc.player == null || terrain == null || !RtMaterialRegistry.INSTANCE.isReady()) {
@@ -175,12 +196,24 @@ public final class RtVoxy {
                 if (memoryBudget == null) memoryBudget = new dev.comfyfluffy.caustica.rt.RtMemoryBudget(ctx);
                 var budget = memoryBudget.read();
                 buildLimit = RtVoxyBuildBudget.limit(budget.localUsage(), budget.localBudget());
+                warmCacheLimit = Math.min(1024L << 20, Math.max(0, (budget.localBudget() - budget.localUsage() - (128L << 20)) / 4));
                 nextBudgetRead = budgetNow + 500_000_000L;
             }
-            long prepareDeadline = System.nanoTime() + 8_000_000;
-            for (int n = 0; n < 512 && System.nanoTime() < prepareDeadline; n++) {
+            long prepareDeadline = System.nanoTime() + 2_000_000;
+            long batchTriangles = 0;
+            for (int n = 0; n < 512 && batch.size() < 32 && System.nanoTime() < prepareDeadline; n++) {
                 CpuCompletion cpu = converted.peek();
                 if (cpu == null) break;
+                if (cpu.generation() == generation && cpu.failure() == null && !needed.contains(cpu.entry().stamp)) {
+                    converted.poll();
+                    Entry stale = cpu.entry();
+                    cache.remove(stale.stamp); pending.remove(stale.stamp); busyKeys.remove(stale.mesh.key);
+                    staleCpuJobs++;
+                    continue;
+                }
+                long nextTriangles = cpu.failure() == null ? cpu.packed().indices().length / 3L : 0;
+                if (cpu.generation() == generation && cpu.failure() == null && nextTriangles != 0
+                        && !RtVoxyLoadBudget.canStart(buildTriangles.get(), batchTriangles, nextTriangles, triangleLimit)) break;
                 if (cpu.generation() == generation && cpu.failure() == null && cpu.packed().indices().length != 0
                         && !RtVoxyBuildBudget.canStart(buildWorkingBytes.get(), RtVoxyBuildBudget.estimate(cpu.packed()), buildLimit)) break;
                 converted.poll();
@@ -189,6 +222,7 @@ public final class RtVoxy {
                 if (cpu.failure() != null) throw new IllegalStateException("Voxy triangle conversion failed", cpu.failure());
                 if (cpu.packed().indices().length == 0) {
                     entry.ready = true;
+                    emptyEntries.addLast(entry);
                     readinessChanged = true;
                     resolveReady(entry);
                     pending.remove(entry.stamp);
@@ -201,6 +235,8 @@ public final class RtVoxy {
                             + p.material().size + p.upload().size + p.blas().buildWorkingBytes()
                             + p.blas().accel.allocatedBytes();
                     buildWorkingBytes.addAndGet(entry.buildWorkingBytes);
+                    entry.buildTriangles = nextTriangles;
+                    batchTriangles += nextTriangles;
                     batch.add(entry);
                     preparedCount++;
                 }
@@ -222,6 +258,7 @@ public final class RtVoxy {
                 if (result.generation() == generation) {
                     readinessChanged = true;
                     resolveReady(entry);
+                    warmEntries.add(entry);
                 }
                 if (result.generation() != generation) ctx.gpuExecutor().retireUnpublished(entry::destroy);
             }
@@ -229,42 +266,56 @@ public final class RtVoxy {
             var realSections = RtTerrain.readySectionSnapshot();
             boolean planChanged = selectionGate.refresh(scene, realSections);
             if (planChanged) {
-                if (sortedScene != scene || Math.abs(sortedX-pos.x) + Math.abs(sortedY-pos.y) + Math.abs(sortedZ-pos.z) >= 8) {
-                    var ordered = new ArrayList<Prioritized>(scene.ancestors().size() + scene.meshes().size());
-                    for (LodMesh mesh : scene.ancestors()) ordered.add(new Prioritized(mesh, priority(mesh, pos.x, pos.y, pos.z)));
-                    for (LodMesh mesh : scene.meshes()) ordered.add(new Prioritized(mesh, priority(mesh, pos.x, pos.y, pos.z)));
-                    ordered.sort(Comparator.comparingDouble(Prioritized::distance));
-                    sortedCandidates = ordered.stream().map(Prioritized::mesh).toList(); sortedScene = scene;
-                    sortedX = pos.x; sortedY = pos.y; sortedZ = pos.z;
-                }
                 if (indexedScene != scene) { hierarchy = LodHierarchy.prepare(scene); indexedScene = scene; }
-                resolved.clear(); plannedStamps.clear(); needed.clear(); workQueue.clear();
-                for (Entry entry : active) resolved.put(entry.mesh.key, entry);
+                resolved=publishedEntries.clone(); plannedStamps.clear(); needed.clear(); workQueue.clear();
                 Long2LongOpenHashMap coverage = coverageHashes(realSections);
-                for (LodMesh mesh : sortedCandidates) {
+                var candidates = new ArrayList<LodMesh>(scene.ancestors().size() + scene.meshes().size());
+                candidates.addAll(scene.ancestors()); candidates.addAll(scene.meshes());
+                for (LodMesh mesh : candidates) {
                     long covered = coverage.get(mesh.key);
                     Stamp stamp = new Stamp(mesh.key, mesh.revision, covered);
                     plannedStamps.put(mesh.key, stamp);
                     needed.add(stamp);
                     Entry entry = cache.get(stamp);
-                    boolean coveredParent = hierarchy.isCoveredParent(mesh.key);
-                    if (entry == null && !coveredParent && mesh.quadCount() == 0) {
+                    if (entry == null && mesh.quadCount() == 0) {
                         entry = new Entry(stamp, mesh); entry.ready = true; cache.put(stamp, entry); dispatchedEmpty++;
+                        emptyEntries.addLast(entry);
                     }
                     if (entry != null) {
-                        entry.lastNeeded = frame;
+                        entry.lastNeeded = profileStart;
                         if (entry.ready) resolved.put(mesh.key, entry);
-                    } else if (!coveredParent) workQueue.addLast(new Request(stamp, mesh, covered));
+                    }
                 }
+                // Sort only missing work; already resident fine geometry must not trigger ancestor builds.
+                var missing = new ArrayList<Prioritized>();
+                for (LodMesh mesh : candidates) if (!cache.containsKey(plannedStamps.get(mesh.key)) && !isCovered(mesh.key))
+                    missing.add(new Prioritized(mesh, priority(mesh, pos.x, pos.y, pos.z)));
+                missing.sort(Comparator.comparingDouble(Prioritized::distance));
+                for (Prioritized work : missing) {
+                    LodMesh mesh = work.mesh();
+                    workQueue.addLast(new Request(plannedStamps.get(mesh.key), mesh, coverage.get(mesh.key)));
+                }
+                plannedRequests += missing.size();
+                selectionGate.remember(scene, realSections);
+            }
+            publicationDirty |= planChanged || readinessChanged;
+            if (selecting != null && selecting.isDone()) {
+                SelectionResult selection = selecting.join();
+                selecting = null;
+                if (selection.generation() == generation && (selection.retireRevision() == retireRevision
+                        || selection.entries().stream().allMatch(e -> e.live && e.ready))) {
+                    readySelection = selection;
+                    coveredSelection = selection.hierarchy();
+                } else publicationDirty = true;
             }
             // Advance the saved queue directly; ready meshes do not consume dispatch work.
             for (int attempts = workQueue.size(); attempts > 0 && pending.size() < 512; attempts--) {
                 Request request = workQueue.removeFirst();
                 LodMesh mesh = request.mesh();
-                if (hierarchy.isCoveredParent(mesh.key) || cache.containsKey(request.stamp())) continue;
+                if (isCovered(mesh.key) || cache.containsKey(request.stamp())) continue;
                 if (busyKeys.contains(mesh.key)) { workQueue.addLast(request); continue; }
                 Entry entry = new Entry(request.stamp(), mesh);
-                entry.lastNeeded = frame;
+                entry.lastNeeded = profileStart;
                 cache.put(entry.stamp, entry); pending.add(entry.stamp); busyKeys.add(mesh.key);
                 dispatchedGeometry++;
                 long token = generation;
@@ -282,18 +333,19 @@ public final class RtVoxy {
                 });
             }
             boolean changed = false;
-            if (planChanged || readinessChanged) {
+            if (readySelection != null && System.nanoTime() >= nextPublication) {
+                nextPublication = System.nanoTime() + 50_000_000L;
                 // The provider owns the hierarchy; readiness gates only the affected branches' publication.
-                List<Entry> desired = new ArrayList<>();
-                for (LodMesh mesh : hierarchy.readySelectionUnsorted(m -> resolved.containsKey(m.key),
-                        () -> active.stream().map(e -> e.mesh).toList())) {
-                    Entry entry = resolved.get(mesh.key);
-                    if (entry.prepared != null) desired.add(entry);
-                }
+                List<Entry> desired = readySelection.drawable();
                 changed = !active.equals(desired);
+                publishedSelection = readySelection.meshes();
+                publishedCoverage = readySelection.coverage();
+                publishedEntries=readySelection.published();
+                warmEntries.addAll(readySelection.departing());
                 if (changed) {
-                    active = List.copyOf(desired);
-                    for (Entry entry : active) if (!entry.published) {
+                    active = desired;
+                    publications++;
+                    for (Entry entry : readySelection.unpublished()) if (!entry.published) {
                         ctx.gpuExecutor().markPublished(entry.build);
                         entry.published = true;
                     }
@@ -305,28 +357,41 @@ public final class RtVoxy {
                         reportedMeshes = active.size();
                     }
                 }
-                Set<Entry> activeSet = new HashSet<>(active);
-                for (long key : hierarchy.coveredParents()) {
-                    Entry entry = resolved.get(key);
-                    if (entry != null && entry.ready && !activeSet.contains(entry)) {
-                        ctx.gpuExecutor().retireAfterGraphics(ctx.gpuExecutor().latestGraphicsUse(), entry::destroy);
-                        cache.remove(entry.stamp); resolved.remove(key);
+                readySelection=null;
+                trimWarm(ctx,System.nanoTime());
+            }
+            if (!warmEntries.isEmpty() && System.nanoTime() >= nextWarmTrim) trimWarm(ctx,System.nanoTime());
+            if (System.nanoTime() >= nextEmptyTrim) trimEmpty(System.nanoTime());
+            // Start the next snapshot only after publication. Its prior partition and departing list
+            // then refer to the same active generation; no other publication can overtake this job.
+            if (publicationDirty && selecting == null && readySelection == null && System.nanoTime() >= nextPublication) {
+                publicationDirty=false;
+                long token=generation, retired=retireRevision;
+                var ready=resolved.clone();
+                var priorEntries=publishedEntries;
+                var prior=publishedSelection;
+                var priorCoverage=publishedCoverage;
+                var priorActive=active;
+                selecting=java.util.concurrent.CompletableFuture.supplyAsync(() -> {
+                    // A delayed publication can contain retained leaves absent from the newest graph.
+                    for (Entry entry : priorEntries.values()) ready.putIfAbsent(entry.mesh.key,entry);
+                    var index=LodHierarchy.prepare(scene);
+                    var meshes=index.readySelectionUnsorted(m -> ready.containsKey(m.key),() -> prior,priorCoverage);
+                    var entries=new ArrayList<Entry>(meshes.size());
+                    var drawable=new ArrayList<Entry>(); var unpublished=new ArrayList<Entry>();
+                    var actual=new ArrayList<LodMesh>(meshes.size());
+                    var published=new Long2ObjectOpenHashMap<Entry>(meshes.size());
+                    for (LodMesh mesh : meshes) {
+                        Entry entry=ready.get(mesh.key);
+                        if (entry==null) throw new IllegalStateException("Published Voxy coverage lost its ready mesh");
+                        entries.add(entry); actual.add(entry.mesh); published.put(entry.mesh.key,entry);
+                        if (entry.prepared!=null) { drawable.add(entry); if(!entry.published) unpublished.add(entry); }
                     }
-                }
-                if (planChanged || cache.size() > scene.meshes().size() + 512) {
-                    var iterator = cache.entrySet().iterator();
-                    while (iterator.hasNext()) {
-                        var item = iterator.next();
-                        Entry entry = item.getValue();
-                        if (entry.ready && !needed.contains(item.getKey()) && !activeSet.contains(entry)
-                                && (frame - entry.lastNeeded > 180 || cache.size() > scene.meshes().size() + 512)) {
-                            ctx.gpuExecutor().retireAfterGraphics(ctx.gpuExecutor().latestGraphicsUse(), entry::destroy);
-                            if (resolved.get(entry.mesh.key) == entry) resolved.remove(entry.mesh.key);
-                            iterator.remove();
-                        }
-                    }
-                }
-                selectionGate.remember(scene, realSections);
+                    var departing=new ArrayList<Entry>();
+                    for (Entry entry : priorActive) if (published.get(entry.mesh.key)!=entry) departing.add(entry);
+                    return new SelectionResult(token,retired,index,List.copyOf(actual),List.copyOf(entries),List.copyOf(drawable),
+                            List.copyOf(unpublished),List.copyOf(departing),published,index.coverage(actual,priorCoverage));
+                },selector);
             }
             if (changed || sourceTable != terrain.tableAddress()) rebuildTable(ctx, terrain);
             if (table != null && (vanillaRevision != terrain.instanceRevision()
@@ -358,6 +423,9 @@ public final class RtVoxy {
                     CausticaMod.LOGGER.info("Voxy RT profile fps={} cpuMs(provider/prepare/select)={}/{}/{} targets={} empty={} quads={} ancestors={} ancestorQuads={} cache={} residentAttributesMiB={} blasMiB={} active={} pending={} cpuReady={} gpuReady={} dispatched(empty/geometry)={}/{} prepared={} readyTargets={} unscheduled={}",
                         profileFrames * 1e9 / (now - profileAt), providerNs / (profileFrames * 1e6), prepareNs / (profileFrames * 1e6), selectionNs / (profileFrames * 1e6),
                         scene.meshes().size(), empty, targetQuads, scene.ancestors().size(), ancestorQuads, cache.size(), residentBytes / 1048576, blasBytes / 1048576, active.size(), pending.size(), converted.size(), completed.size(), dispatchedEmpty, dispatchedGeometry, preparedCount, readyTargets, workQueue.size());
+                    CausticaMod.LOGGER.info("Voxy RT load budget triangles={} inFlightTriangles={} publications={} plannedRequests={} staleCpuJobs={} warmLimitMiB={}",
+                            triangleLimit, buildTriangles.get(), publications, plannedRequests, staleCpuJobs, warmCacheLimit / 1048576);
+                    publications = plannedRequests = staleCpuJobs = 0;
                     profileAt = now; profileFrames = providerNs = prepareNs = selectionNs = dispatchedEmpty = dispatchedGeometry = preparedCount = 0;
                 }
             }
@@ -378,6 +446,7 @@ public final class RtVoxy {
         }
 
         private void submit(RtContext ctx, List<Entry> entries) {
+            for (Entry entry : entries) buildTriangles.addAndGet(entry.buildTriangles);
             long token = generation;
             var builds = entries.stream().map(e -> e.prepared.blas()).toList();
             ctx.gpuExecutor().submit(cmd -> {
@@ -390,6 +459,47 @@ public final class RtVoxy {
                 if (failure == null && token == generation) compact(ctx, token, entries, build);
                 else for (Entry entry : entries) finish(ctx, token, entry, build, failure);
             });
+        }
+
+        private boolean isCovered(long key) {
+            return hierarchy != null && hierarchy.coveredBy(coveredSelection,key);
+        }
+
+        private static long residentBytes(Entry entry) {
+            return entry.prepared.uvs().size + entry.prepared.material().size + entry.prepared.blas().accel.allocatedBytes();
+        }
+
+        private void trimWarm(RtContext ctx, long now) {
+            nextWarmTrim=now+500_000_000L;
+            warmEntries.removeIf(e -> !e.live || publishedEntries.get(e.mesh.key) == e);
+            warmEntries.sort(Comparator.comparingLong(e -> e.lastNeeded));
+            long bytes=0;
+            for (Entry entry : warmEntries) if (!needed.contains(entry.stamp) || isCovered(entry.mesh.key)) bytes+=residentBytes(entry);
+            var iterator=warmEntries.iterator();
+            while (iterator.hasNext()) {
+                Entry entry=iterator.next();
+                if (needed.contains(entry.stamp) && !isCovered(entry.mesh.key)) continue;
+                if (bytes > warmCacheLimit || now-entry.lastNeeded > 10_000_000_000L) {
+                    bytes-=residentBytes(entry);
+                    entry.live=false; retireRevision++;
+                    ctx.gpuExecutor().retireAfterGraphics(ctx.gpuExecutor().latestGraphicsUse(),entry::destroy);
+                    cache.remove(entry.stamp);
+                    if (resolved.get(entry.mesh.key)==entry) resolved.remove(entry.mesh.key);
+                    iterator.remove();
+                }
+            }
+        }
+
+        private void trimEmpty(long now) {
+            nextEmptyTrim=now+500_000_000L;
+            for (int n=Math.min(8192,emptyEntries.size());n>0;n--) {
+                Entry entry=emptyEntries.removeFirst();
+                if (!entry.live) continue;
+                if (emptyEntries.size()>=65536 && !needed.contains(entry.stamp) && publishedEntries.get(entry.mesh.key)!=entry) {
+                    entry.live=false; retireRevision++; cache.remove(entry.stamp);
+                    if (resolved.get(entry.mesh.key)==entry) resolved.remove(entry.mesh.key);
+                } else emptyEntries.addLast(entry);
+            }
         }
 
         private void compact(RtContext ctx, long token, List<Entry> entries, RtGpuExecutor.Build build) {
@@ -416,6 +526,7 @@ public final class RtVoxy {
 
         private void finish(RtContext ctx, long token, Entry entry, RtGpuExecutor.Build build, Throwable failure) {
             buildWorkingBytes.addAndGet(-entry.buildWorkingBytes);
+            buildTriangles.addAndGet(-entry.buildTriangles);
             synchronized (completed) {
                 if (token != generation) {
                     if (failure == null) ctx.gpuExecutor().retireUnpublished(entry::destroy);
@@ -470,8 +581,10 @@ public final class RtVoxy {
                 }
             }
             synchronized (converted) { converted.clear(); }
-            for (Entry entry : cache.values()) if (entry.ready)
-                ctx.gpuExecutor().retireAfterGraphics(ctx.gpuExecutor().latestGraphicsUse(), entry::destroy);
+            for (Entry entry : cache.values()) {
+                entry.live=false;
+                if (entry.ready) ctx.gpuExecutor().retireAfterGraphics(ctx.gpuExecutor().latestGraphicsUse(), entry::destroy);
+            }
             cache.clear(); pending.clear(); busyKeys.clear(); active = List.of(); instances = List.of();
             if (table != null) {
                 RtBuffer old = table;
@@ -480,10 +593,15 @@ public final class RtVoxy {
             }
             sourceTable = 0; epoch = -1;
             reportedMeshes = 0;
-            sortedScene = null; sortedCandidates = List.of();
             indexedScene = null; hierarchy = null;
             selectionGate.clear(); vanillaRevision = -1;
             resolved.clear(); plannedStamps.clear(); needed.clear(); workQueue.clear();
+            publishedSelection = List.of(); publishedCoverage = null; publishedEntries=new Long2ObjectOpenHashMap<>();
+            // Background selection reads immutable snapshots only; an old generation cannot publish GPU resources.
+            selecting = null; readySelection = null; coveredSelection = null;
+            publicationDirty = false; nextPublication = 0;
+            warmEntries.clear(); nextWarmTrim=0;
+            emptyEntries.clear(); nextEmptyTrim=0;
         }
 
         private static Long2LongOpenHashMap coverageHashes(it.unimi.dsi.fastutil.longs.LongSet sections) {

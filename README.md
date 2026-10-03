@@ -4,6 +4,11 @@ Caustica is an experimental ray-traced renderer for Minecraft 26.2's Vulkan back
 It replaces the vanilla world view with hardware ray tracing and NVIDIA DLSS
 features while keeping Minecraft's familiar UI and gameplay intact.
 
+This `codex/lodfix6-10000` branch integrates the matching Minecraft 26.2 Vulkan
+Voxy branch through external LOD API 5. Voxy supplies LOD geometry; Caustica
+ray traces it alongside real chunks. The maximum ray segment length is
+**10000 blocks**. See [Voxy integration and build instructions](docs/VOXY-INTEGRATION.md).
+
 Caustica is early software. Expect bugs, missing visual cases, and frequent
 changes while the renderer is being built.
 
@@ -82,5 +87,5 @@ license terms. See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
 - [ ] Nether/End sky, weather, volumetric fog/clouds
 - [ ] NRD + FSR for non-NVIDIA GPUs
-- [ ] LOD
+- [x] Voxy LOD integration through external renderer API 5
 - [ ] ReSTIR

@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - main
+      - codex/lodfix6-10000
     paths:
       - ".github/workflows/**"
       - "build.gradle"
@@ -27,6 +28,7 @@ on:
       - "native/**"
       - "shaders/**"
       - "src/**"
+  workflow_dispatch:
 
 env:
   DLSS_SDK_REF: v310.7.0
@@ -35,6 +37,8 @@ env:
   NGX_VENDOR_CONFIG: rel
   VULKAN_SDK_VERSION: 1.4.350.0
   VULKAN_SDK_SHA256: b65f068ab36263559da49d7cacd7e7b9df23824ca8b68ccc522a2b06f5725df2
+  VOXY_REPOSITORY: skayla2007/voxy
+  VOXY_REF: 0b61b96d1e4a495522ece3c1428e7e78b162c0d2
 
 jobs:
   native-windows:
@@ -130,6 +134,15 @@ jobs:
     steps:
       - name: Checkout Caustica
         uses: actions/checkout@v4
+        with:
+          path: Caustica
+
+      - name: Checkout matching Voxy provider
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.VOXY_REPOSITORY }}
+          ref: ${{ env.VOXY_REF }}
+          path: voxy
 
       - name: Checkout DLSS SDK
         uses: actions/checkout@v4
@@ -146,6 +159,9 @@ jobs:
 
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v4
+
+      - name: Build matching Voxy provider
+        run: bash ./voxy/gradlew -p voxy build
 
       - name: Install Vulkan SDK shader tools
         run: |
@@ -168,14 +184,15 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           pattern: ngxshim-*
-          path: build/native/ngx_shim/release
+          path: Caustica/build/native/ngx_shim/release
           merge-multiple: true
 
       - name: Build bundled jar
+        working-directory: Caustica
         env:
           DLSS_SDK: ${{ github.workspace }}/${{ env.DLSS_SDK_PATH }}
         run: >
-          bash ./gradlew build
+          bash ../voxy/gradlew build
           -PngxPlatforms=windows-x64,linux-x64
           -PngxVendorConfig=${{ env.NGX_VENDOR_CONFIG }}
           -PngxShimConfig=${{ env.NGX_SHIM_CONFIG }}
@@ -185,7 +202,7 @@ jobs:
         with:
           name: caustica-bundled-jar
           path: |
-            build/libs/*.jar
-            !build/libs/*-sources.jar
-            !build/libs/*-dev.jar
+            Caustica/build/libs/*.jar
+            !Caustica/build/libs/*-sources.jar
+            !Caustica/build/libs/*-dev.jar
           if-no-files-found: error

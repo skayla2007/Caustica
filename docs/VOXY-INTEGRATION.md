@@ -76,6 +76,9 @@ ambiguous provider versions. CMake writes the shim to
 runtime libraries and compiles/validates the shader modules. Output mod JARs are
 in each project's `build/libs`; do not install `*-sources.jar` files.
 
+The GitHub workflow also checks out the matching Voxy provider at a pinned commit
+and builds it before packaging Caustica, using sibling checkout directories.
+
 Install the matching pair, Fabric Loader and Fabric API for Minecraft 26.2, and
 launch with the Vulkan graphics backend. For a development client with both mods:
 
